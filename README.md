@@ -18,9 +18,35 @@ This project is built for personal use and experimentation, prioritizing clarity
 
 ## Installation & Getting Started
 
+### Setup Script (recommended)
+
+[`scripts/mesh_setup.py`](scripts/mesh_setup.py) automates the full setup: clones the four MeshSuite repos, runs `uv sync` with the right extras, walks through an interactive interview, writes each project's `config.json`, and optionally renders deploy artifacts (systemd units, nginx config, and a deploy guide) with best-guess install paths for your OS.
+
+**One-line bootstrap** — download and run in an empty directory:
+
+```
+python3 <(curl -s https://raw.githubusercontent.com/epohs/mesh-collector/main/scripts/mesh_setup.py)
+```
+
+Or clone the collector and run from its checkout:
+
+```
+git clone https://github.com/epohs/mesh-collector.git
+cd mesh-collector
+python3 scripts/mesh_setup.py
+```
+
+**What it is not:** `mesh_setup.py` is a setup interview, not a service manager, updater, uninstaller, or health check. It never writes to `/etc`, never runs `systemctl`, and — with one narrow, documented exception (a single `.gitignore` line for the `uv.toml` override) — never edits a tracked file. It has no non-interactive mode; the interview is the product.
+
+After setup, see the summary for the next action — either `uv run scripts/run_collector.py` for interactive use or `deploy-guide/README.md` for persistent deployment.
+
+---
+
+### Manual setup
+
 This project uses [uv](https://docs.astral.sh/uv/) for Python dependency management and virtual environments.
 
-### Prerequisites
+#### Prerequisites
 - Python 3.13 or newer
 - `uv` installed globally
 - A Meshtastic-compatible node (for live data collection)
