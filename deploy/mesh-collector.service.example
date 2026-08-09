@@ -1,0 +1,71 @@
+[Unit]
+Description=mesh-collector Meshtastic Collector
+After=network.target
+
+[Service]
+Type=simple
+
+#
+# This service runs the mesh-collector Meshtastic collector as a long-lived process.
+#
+# The collector connects to a Meshtastic device via a local serial interface,
+# listens for incoming packets, and persists selected messages and channel
+# data into a SQLite database.
+#
+# The process is expected to run continuously; systemd will automatically
+# restart it if the collector exits or crashes.
+#
+
+User=YOURUSERNAME
+Group=YOURGROUP
+
+# Project root directory
+WorkingDirectory=/path/to/mesh-collector
+
+# Ensure unbuffered output so logs appear immediately in journald
+Environment=PYTHONUNBUFFERED=1
+
+#
+# Transmitting (optional, and off unless you turn it on)
+# ------------------------------------------------------
+#
+# Uncomment these two only if this collector should accept send requests over a
+# mesh-link control socket, and only after installing with `uv sync --extra tx`.
+# Without the extra the collector has no mesh-link to import and will refuse to
+# start with ENABLE_TX set, rather than come up quietly unable to send.
+#
+# RuntimeDirectory gives you /run/mesh-collector, created on start and removed
+# on stop, owned by the User above. That is the right home for a socket: it is
+# runtime state, it should not outlive the process, and /run is not affected by
+# PrivateTmp below.
+#
+# **Note the interaction with PrivateTmp=true.** With that set, this unit gets
+# its own /tmp, so a socket placed there would be invisible to every client
+# outside the unit — including a Mesh Console you run yourself. Either keep the
+# socket in /run as below, or turn PrivateTmp off. /run is the better answer.
+#
+# Whoever can write to that socket can transmit on your radio. It is created
+# mode 0600 and owned by User, so keep the directory mode at 0700 and do not
+# widen either to make something else work.
+#
+# RuntimeDirectory=mesh-collector
+# RuntimeDirectoryMode=0700
+# Environment=MESH_COLLECTOR_ENABLE_TX=true
+# Environment=MESH_COLLECTOR_CONTROL_SOCKET_PATH=/run/mesh-collector/control.sock
+
+# Launch the collector from the project virtual environment
+ExecStart=/path/to/mesh-collector/.venv/bin/python /path/to/mesh-collector/scripts/run_collector.py
+
+# Always restart on failure or unexpected exit
+Restart=always
+RestartSec=5
+
+# ---------------------------------------------------------------------------
+# Lightweight hardening (safe for serial-connected services)
+# ---------------------------------------------------------------------------
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

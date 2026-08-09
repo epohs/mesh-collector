@@ -1,0 +1,20 @@
+{
+    "DEBUG": false,
+    "DB_PATH": "data/db.sqlite",
+
+    "MAX_MESSAGES": 1000,
+    "MAX_DIRECT_MESSAGES": 1000,
+    "NODE_PRUNE_DAYS": 14,
+    "PRUNE_INTERVAL": 5,
+    "SERIAL_PORT": "/dev/ttyACM0",
+    "ALLOW_DESTRUCTIVE_REBUILD": false,
+    "TIDY_LOGS": true,
+
+    "STORE_DIRECT_MESSAGES": false,
+    "LOG_PRIMARY_CHANNEL": true,
+    "PRIMARY_CHANNEL": 0,
+    "LOG_CHANNEL_IDS": [],
+
+    "ENABLE_TX": false,
+    "CONTROL_SOCKET_PATH": "/run/mesh-collector/control.sock"
+}

@@ -1,0 +1,55 @@
+# macOS
+__MACOSX/
+.DS_Store
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+
+# Flask stuff:
+instance/
+.webassets-cache
+*.log
+
+
+# SQLite
+*.db
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.bak
+
+
+# Deployment config file
+config.json
+
+
+# Local Gunicorn configuration (use deploy/gunicorn.conf.py.example)
+gunicorn.conf.py
+
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+
+#VSCode
+.vscode/

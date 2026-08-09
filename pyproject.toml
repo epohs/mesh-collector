@@ -1,0 +1,38 @@
+[project]
+name = "mesh-collector"
+version = "0.5.0"
+description = "Collects Meshtastic nodes and messages into a SQLite archive."
+readme = "README.md"
+license = { text = "AGPL-3.0-or-later" }
+authors = [
+    { name = "epohs" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "meshtastic",
+    "pypubsub",
+]
+
+# A table rather than an inline `urls = { ... }` spread over several lines: TOML
+# requires an inline table to be on one line, so the form inherited from RxOnly
+# is not valid TOML. uv's parser tolerates it; tomllib and hatchling do not.
+[project.urls]
+Homepage = "https://github.com/epohs/mesh-collector"
+Repository = "https://github.com/epohs/mesh-collector"
+
+# Transmitting is opt-in, and it is opt-in here as well as in the config. An
+# install without this extra has no mesh-link in its import path, so ENABLE_TX
+# has nothing to switch on — the same reasoning that keeps meshtastic out of
+# RxOnly. Archive-only collectors stay exactly what they were.
+#
+#   uv sync              archive only
+#   uv sync --extra tx   archive, and transmit when ENABLE_TX is set
+[project.optional-dependencies]
+tx = [
+    "mesh-link",
+]
+
+# mesh-link is a sibling project rather than a published package. Point this at
+# a git URL or a version once it is released somewhere.
+[tool.uv.sources]
+mesh-link = { path = "../mesh-link" }

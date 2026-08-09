@@ -1,0 +1,5 @@
+# The database containing node and message
+# information will live in this directory
+# by default. This file ensures that the 
+# directory is versioned in git, mainly for
+# clarity.
