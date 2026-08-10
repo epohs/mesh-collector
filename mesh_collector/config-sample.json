@@ -5,7 +5,7 @@
     "MAX_MESSAGES": 1000,
     "MAX_DIRECT_MESSAGES": 1000,
     "NODE_PRUNE_DAYS": 14,
-    "PRUNE_INTERVAL": 5,
+    "PRUNE_INTERVAL": 25,
     "SERIAL_PORT": "/dev/ttyACM0",
     "ALLOW_DESTRUCTIVE_REBUILD": false,
     "TIDY_LOGS": true,

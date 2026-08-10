@@ -38,6 +38,66 @@ def node_num_to_hex_id(node_num: int | str) -> str:
 
 
 
+# The shape nodes.node_id is contracted to hold. Row creation is gated on this
+# rather than on having a name: a node heard only by number is a real node, but
+# a malformed id is a bug, and the readers join on this column.
+NODE_ID_PATTERN = re.compile(r"^![0-9a-f]{8}$")
+
+
+
+
+def _first_value(source: dict, *keys):
+  """The first of `keys` holding a non-null value.
+
+  Not `a or b`: an SNR or RSSI of exactly 0 is a measurement, and truthiness
+  throws it away — which for RSSI, whose useful range straddles nothing in
+  particular, silently dropped a real reading.
+  """
+  for key in keys:
+    value = source.get(key)
+    if value is not None:
+      return value
+
+  return None
+
+
+
+
+def _identity_label(row: dict) -> str:
+  """Render a node row's identity for the log — "Foo Bar (FOO)" when it has
+  both names, whichever one it has when it has one, "unnamed" when it has
+  neither. Nameless is now an ordinary, expected state for a row."""
+  long_name = row.get("long_name")
+  short_name = row.get("short_name")
+
+  if long_name and short_name:
+    return f"{long_name} ({short_name})"
+
+  return long_name or short_name or "unnamed"
+
+
+
+
+def _is_fabricated_identity(node_id: str, user: dict) -> bool:
+  """True when a cached `user` is meshtastic's invention rather than something
+  a node broadcast.
+
+  The library's _getOrCreateByNum (mesh_interface.py:1523) fills in every node
+  it learns by number alone with longName "Meshtastic <suffix>", shortName
+  "<suffix>", hwModel "UNSET". Nothing announced those names, and archiving
+  them buries the fact that the node is still unidentified — so match the
+  formula exactly and treat a hit as no identity at all.
+  """
+  suffix = node_id[-4:]
+  return (
+    user.get("longName") == f"Meshtastic {suffix}"
+    and user.get("shortName") == suffix
+    and user.get("hwModel") == "UNSET"
+  )
+
+
+
+
 class MeshtasticCollector:
   """
   Collects Meshtastic packets via serial interface and persists
@@ -510,6 +570,13 @@ class MeshtasticCollector:
 
     decoded = packet.get("decoded")
     if not decoded:
+      # A decision, not an oversight: an undecryptable packet gets no row and
+      # no last_seen bump. Its `from` is readable, so it *could* register a
+      # node — but the device is on a channel it can't read, `nodes` would
+      # stop meaning "heard and understood by this radio", and the firmware
+      # skips its own NodeDB update for the same packets. NEIGHBORINFO_APP
+      # and TRACEROUTE_APP are excluded on the same principle: they name
+      # nodes this radio has not heard from directly.
       return
 
     from_node_id = packet.get("fromId")
@@ -538,13 +605,13 @@ class MeshtasticCollector:
       # portnum, so a node first heard via telemetry or position — or pruned
       # and come back — contributes immediately instead of waiting hours for
       # its next NODEINFO broadcast.
-      seeded = self._seed_node_from_interface(from_node_id)
-      if not seeded and portnum != "TEXT_MESSAGE_APP":
-        # No identity anywhere; _apply_node_update would refuse the row
-        # anyway. Text is exempt: the message itself is worth archiving even
-        # while the sender can't be named yet.
-        logging.debug("Skip: %s (unknown node, not in interface cache)", from_node_id)
-        return
+      #
+      # A miss is not a reason to drop the packet. The radio only solicits
+      # NodeInfo while its NodeDB has room (firmware MeshService.cpp:97, and
+      # MAX_NUM_NODES is compile-time), so a node the cache doesn't name may
+      # never be named — waiting for an identity loses it permanently. Fall
+      # through and let the normalized packet create a bare row instead.
+      self._seed_node_from_interface(from_node_id)
 
     if portnum == "TEXT_MESSAGE_APP":
       # Gating on portnum, not decoded["text"]: the library sets text for
@@ -562,8 +629,8 @@ class MeshtasticCollector:
     normalized = {
       "user": {"id": from_node_id},
       "decoded": decoded,
-      "snr": packet.get("rxSnr") or packet.get("snr"),
-      "rssi": packet.get("rxRssi") or packet.get("rx_rssi"),
+      "snr": _first_value(packet, "rxSnr", "snr"),
+      "rssi": _first_value(packet, "rxRssi", "rx_rssi"),
       # The packet's own clock. rxTime is 0 or absent when the device has no
       # time fix, but a live packet is still live — the wall clock is the
       # honest fallback here, and only here; node dicts carry lastHeard or
@@ -619,19 +686,37 @@ class MeshtasticCollector:
 
     logging.info("Starting initial node sync for %d nodes", len(self.interface.nodes))
 
+    inserted = 0
+
     for node_id, node in self.interface.nodes.items():
       try:
-        self._on_node_update(node, from_initial_sync=True)
+        # Quiet: a first run replays the device's whole node cache, and a
+        # hundred "New node discovered" lines say less than the one count
+        # below. Every *live* path stays loud.
+        if self._on_node_update(node, quiet=True):
+          inserted += 1
       except Exception:
         logging.exception("Error during initial sync for node_id=%s", node_id)
 
-    logging.info("Initial node sync complete")
+    logging.info(
+      "Initial node sync complete: %d new node%s from the device cache",
+      inserted,
+      "" if inserted == 1 else "s",
+    )
 
 
 
 
   def _on_node_updated(self, node: dict, interface=None) -> None:
     """The meshtastic.node.updated listener, with the kwargs the library sends.
+
+    This topic is not a live feed, whatever its name and the library's own
+    docstring suggest. The firmware only emits node_info during the
+    want_config handshake (PhoneAPI.cpp:512), so it fires at connect and after
+    a device reboot, and never for a node heard mid-session. **Live discovery
+    rests entirely on meshtastic.receive.** The subscription is kept because
+    it is correct and cheap for what it does cover — a reboot's worth of
+    device NodeDB — not because it finds new nodes.
 
     meshtastic publishes this topic as `node=`/`interface=`, and pypubsub takes
     a topic's argument spec from its first *subscriber* — so when
@@ -648,56 +733,65 @@ class MeshtasticCollector:
 
 
 
-  def _on_node_update(self, node_data: dict, from_initial_sync: bool = False) -> None:
+  def _on_node_update(self, node_data: dict, quiet: bool = False) -> bool:
     """
-    Update node record in database.
+    Update node record in database. Returns True when a row was inserted.
     Accepts full NODEINFO or partial updates (POSITION_APP, TELEMETRY_APP).
+
+    `quiet` suppresses the per-node INFO lines and nothing else; it is for the
+    startup replay, which reports a count instead. It used to be spelled
+    from_initial_sync and meant both "be quiet" and "this is the replay",
+    which is why the seed path — a live discovery — logged nothing.
 
     Reached from _on_node_updated (the meshtastic.node.updated listener), so
     the same rule as _on_receive applies: this runs on a library thread and
     nothing may escape it.
     """
     try:
-      self._apply_node_update(node_data, from_initial_sync)
+      return self._apply_node_update(node_data, quiet)
     except Exception:
       logging.exception("Error updating node record")
+      return False
 
 
 
 
-  def _apply_node_update(self, node_data: dict, from_initial_sync: bool) -> None:
-    user_data = node_data.get("user", {})
-    node_id = str(user_data.get("id") or node_data.get("id"))
+  def _apply_node_update(self, node_data: dict, quiet: bool) -> bool:
+    user_data = node_data.get("user") or {}
+    raw_num = node_data.get("num")
+    node_id = str(
+      user_data.get("id")
+      or node_data.get("id")
+      or (node_num_to_hex_id(raw_num) if raw_num is not None else "")
+    )
 
     decoded = node_data.get("decoded", {})
     portnum = decoded.get("portnum")
 
-    if not node_id:
+    # Well-formedness, not identity, is what gates a row. Anything else is a
+    # bug upstream of here — including the literal "None" this used to derive
+    # from a node dict carrying neither user.id nor id, which the old `if not
+    # node_id` guard could never catch.
+    if not NODE_ID_PATTERN.match(node_id):
       logging.warning(
-        "Received node data without id (snippet: %s)",
+        "Received node data with unusable id %r (snippet: %s)",
+        node_id,
         repr(node_data)[:200],
       )
-      return
+      return False
 
-    has_identity = bool(
-      user_data.get("longName")
-      or user_data.get("shortName")
-      or user_data.get("hwModel")
-      or user_data.get("role")
-      or user_data.get("publicKey")
-    )
+    if _is_fabricated_identity(node_id, user_data):
+      # The library invented these. Drop the three fabricated fields and keep
+      # everything else the record carries — position, telemetry, lastHeard
+      # are real. The node stays unnamed until it says who it is.
+      logging.debug("Discarding fabricated identity for %s", node_id)
+      user_data = {
+        k: v for k, v in user_data.items()
+        if k not in ("longName", "shortName", "hwModel")
+      }
 
     existing = self.storage.get_node(node_id) or {}
     is_new_node = not existing
-
-    if is_new_node and not has_identity:
-      # Creation is gated on identity, not on which path delivered it: a
-      # NODEINFO packet, the initial sync, the interface cache and a
-      # node.updated event all carry names, and any of them may create the
-      # row. What may not is an identity-less update — a row nothing can
-      # name is what the readers join against.
-      logging.debug("Ignoring identity-less %s for unknown node %s", portnum, node_id)
-      return
 
     device_metrics = node_data.get("deviceMetrics", {})
     environment = node_data.get("environmentMetrics", {})
@@ -726,15 +820,34 @@ class MeshtasticCollector:
 
     self.storage.upsert_node(node_id=node_id, is_new=is_new_node, **merged)
 
-    if from_initial_sync:
-      logging.debug("Initial sync: node %s inserted/updated", node_id)
-      return
+    # A node that had no name and now has one. This is the line that answers
+    # "is discovery working?" — the other half of a discovery that began as a
+    # bare row hours earlier, and the only evidence the two-stage pipeline
+    # closes at all.
+    became_named = (
+      not is_new_node
+      and not (existing.get("long_name") or existing.get("short_name"))
+      and bool(merged.get("long_name") or merged.get("short_name"))
+    )
 
-    # Log new node discovery with initial data
+    if quiet:
+      logging.debug("Initial sync: node %s inserted/updated", node_id)
+      return is_new_node
+
     if is_new_node:
-      initial_data = {k: v for k, v in merged.items() if v is not None and k != "last_seen"}
-      logging.info("New node discovered: %s %s", node_id, initial_data)
-      return
+      # Where it was heard, and whether it arrived with a name. Node dicts out
+      # of the device's own cache carry no portnum.
+      logging.info(
+        "New node discovered: %s (%s, %s)",
+        node_id,
+        portnum or "device cache",
+        _identity_label(merged),
+      )
+      return True
+
+    if became_named:
+      logging.info("Node %s identified: %s", node_id, _identity_label(merged))
+      return False
 
     # Log only fields that actually changed for existing nodes
     changed = {}
@@ -755,39 +868,50 @@ class MeshtasticCollector:
     else:
       logging.debug("Skip: %s (no changes)", node_id)
 
+    return False
+
 
 
 
   def _seed_node_from_interface(self, from_node_id: str) -> bool:
     """
     If a packet arrives from a node not yet in our DB, check the meshtastic
-    interface's internal node cache. The device may have received a NODEINFO_APP
-    for this node previously (even before our collector started), so its identity
-    is available there even though we never processed that packet ourselves.
+    interface's internal node caches. The device may have received a
+    NODEINFO_APP for this node previously (even before our collector started),
+    so its identity — and its last known position and telemetry — is available
+    there even though we never processed that packet ourselves.
 
-    Returns True when a cached identity was found and pushed to the database.
+    There are two caches and they are not equivalent. `nodes` is keyed by
+    "!hex" and the library only writes it from NODEINFO, so it holds real
+    identities and nothing else. `nodesByNum` is keyed by int and also gains
+    an entry for every telemetry, position, text or admin sender — but the
+    library fabricates a name for those (see _is_fabricated_identity). Read
+    the trustworthy cache first, then fall back to the other for its
+    non-identity fields.
+
+    Returns True when a cached record was found and pushed to the database.
+    Whether it carried a usable identity is _apply_node_update's call — it
+    applies the same fabrication check to every path, including the startup
+    sync.
     """
-    if not self.interface or not self.interface.nodes:
+    if not self.interface:
       return False
 
-    node_data = self.interface.nodes.get(from_node_id)
+    node_data = (self.interface.nodes or {}).get(from_node_id)
+
+    if not node_data and NODE_ID_PATTERN.match(from_node_id):
+      by_num = getattr(self.interface, "nodesByNum", None) or {}
+      node_data = by_num.get(int(from_node_id[1:], 16))
+
     if not node_data:
-      return False
-
-    user = node_data.get("user", {})
-    has_identity = bool(
-      user.get("longName")
-      or user.get("shortName")
-      or user.get("hwModel")
-    )
-    if not has_identity:
       return False
 
     logging.debug(
       "Seeding unknown node %s from interface cache",
       from_node_id,
     )
-    self._on_node_update(node_data, from_initial_sync=True)
+    # Not quiet: this is a live discovery, however the identity reached us.
+    self._on_node_update(node_data)
     return True
 
 
@@ -816,7 +940,14 @@ class MeshtasticCollector:
     rssi = packet.get("rxRssi")
     hop_start = packet.get("hopStart")
     hop_limit = packet.get("hopLimit")
-    hop_count = (hop_start - hop_limit) if hop_start and hop_limit else None
+    # `is not None`, not truthiness: hopLimit is 0 on a packet that spent
+    # every hop getting here — the most-travelled messages are exactly the
+    # ones whose hop count used to come out NULL.
+    hop_count = (
+      hop_start - hop_limit
+      if hop_start is not None and hop_limit is not None
+      else None
+    )
     channel_index = packet.get("channel", 0)
     reply_to = decoded.get("replyId")
     via_mqtt = packet.get("viaMqtt", False)

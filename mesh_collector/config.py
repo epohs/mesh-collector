@@ -24,7 +24,13 @@ SHARED_CONFIG = {
 COLLECTOR_CONFIG = {
   "MAX_MESSAGES": 1000,               # Max channel messages to keep across all channels
   "MAX_DIRECT_MESSAGES": 1000,        # Max direct messages to keep
-  "PRUNE_INTERVAL": 5,                # Only attempt pruning every X writes
+  # Only attempt pruning every X inserts, counted separately for channel
+  # messages, DMs and nodes. Raised from 5 because nodes now get a row the
+  # first time they are heard rather than the first time they are named, so
+  # node inserts are far more frequent and a full-table scan every fifth one
+  # is wasted work. Pruning stays timely: the caps it enforces are in the
+  # thousands and NODE_PRUNE_DAYS is in days.
+  "PRUNE_INTERVAL": 25,
   "NODE_PRUNE_DAYS": 14,              # Nodes unseen in X days will be pruned
   "SERIAL_PORT": "/dev/ttyACM0",      # Meshtastic serial device location
   "STORE_DIRECT_MESSAGES": False,     # Should the collector archive direct messages
