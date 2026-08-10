@@ -1,4 +1,4 @@
--- schema_version: 0.8.0
+-- schema_version: 0.9.0
 
 -- -------------------
 -- What the version number promises
@@ -30,6 +30,11 @@
 -- That they agree today is what they each happen to select and not the two being
 -- kept in step; the constants are still declared separately in each project, and
 -- the next column one of them selects alone will part them again.
+--
+-- 0.9.0 is that promise being collected rather than restated: it adds six
+-- columns to `nodes` and neither reader was touched, so both still declare
+-- 0.8.0 and both still read this archive correctly. A reader that wants the new
+-- columns raises its own constant when it starts selecting them, and not before.
 --
 -- The collector itself is stricter, and has to be: it has no migrations, so any
 -- difference between this file and an existing database means a rebuild. See
@@ -84,6 +89,53 @@ CREATE TABLE IF NOT EXISTS meta (
 -- channel_util, air_util_tx and uptime_seconds come from device metrics and
 -- local stats, which report the same radio-health numbers.
 --
+-- 0.9.0 adds six more on the same latest-value-only terms. Three of them are
+-- facts about how a node was heard rather than anything it measured:
+--
+--   hops_away        Hops between this radio and the node. 0 is a direct
+--                    neighbour and is a real reading, not a missing one —
+--                    read this column with IS NULL, never with falsiness.
+--                    The firmware tracks it (NodeDB.cpp:1946) and the library
+--                    hangs it on the node dict; for a live packet it is
+--                    hopStart - hopLimit. It earns its width because it is
+--                    one of the very few things knowable about a node that
+--                    has never sent a NODEINFO, and such rows are ~10% of
+--                    this table.
+--   via_mqtt         1 when the node was last heard through an MQTT gateway,
+--                    0 when it was last heard over RF, NULL when only the
+--                    device's own node cache has ever described it. Same
+--                    meaning as messages.via_mqtt, which has had the column
+--                    since before this one existed; `nodes` lacking it was an
+--                    inconsistency. A decoded packet settles it either way,
+--                    because the library omits the field when it is false and
+--                    false is exactly what a LoRa packet means. A cache
+--                    replay can only ever set it — absence there is silence
+--                    rather than a denial, and silence stays NULL.
+--   has_public_key   1 when the node published a PKI public key, 0 when a
+--                    NODEINFO this collector decoded carried none, and NULL
+--                    while no NODEINFO has ever arrived at all — which for a
+--                    nameless row is the ordinary state and not a gap to be
+--                    filled in. **The key itself is deliberately not stored.**
+--                    Presence is the entire signal an archive owes anybody,
+--                    and the log's own byte-field table already reduces
+--                    public_key to its shape for the same reason (see
+--                    _BYTE_FIELDS in collector/__init__.py) — a key is not
+--                    legible to a reader in any alphabet.
+--
+-- The other three are environment-metrics fields 0.8.0 decoded and then threw
+-- away: lux, iaq (air-quality index, 0-500) and gas_resistance (the raw MOhm
+-- reading iaq is derived from). They arrive together, from BME680-class
+-- sensors.
+--
+-- The rest of that arm — windSpeed, windDirection, radiation — and the whole
+-- of the airQualityMetrics, powerMetrics, healthMetrics and hostMetrics arms
+-- have columns nowhere, on purpose. Nothing on this mesh emits them: a
+-- 45-minute window carrying 247 device-metrics frames contained not one, and
+-- powerMetrics stayed absent even with five solar nodes in the table, because
+-- that arm is opt-in firmware telemetry nobody enabled. A column that is
+-- always NULL is width plus a promise to readers that something is being
+-- collected. They are one MINOR bump away the day hardware shows up.
+--
 CREATE TABLE IF NOT EXISTS nodes (
     node_id TEXT PRIMARY KEY,
     short_name TEXT,
@@ -104,7 +156,17 @@ CREATE TABLE IF NOT EXISTS nodes (
     pressure REAL,
     channel_util REAL,
     air_util_tx REAL,
-    uptime_seconds INTEGER
+    uptime_seconds INTEGER,
+    -- Appended rather than slotted in beside the columns they belong with.
+    -- A reader selecting by name cannot tell the difference, but one that
+    -- indexes a `SELECT *` row positionally can, and additive has to mean
+    -- additive for both kinds.
+    hops_away INTEGER,
+    via_mqtt INTEGER DEFAULT 0,
+    has_public_key INTEGER DEFAULT 0,
+    lux REAL,
+    iaq INTEGER,
+    gas_resistance REAL
 );
 
 -- Index to quickly find active nodes by last_seen

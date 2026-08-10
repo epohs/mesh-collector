@@ -63,6 +63,28 @@ def _first_value(source: dict, *keys):
 
 
 
+def _hops_taken(packet: dict) -> Optional[int]:
+  """How many hops this packet spent getting here, or None if it can't be known.
+
+  `is not None`, not truthiness: hopLimit is 0 on a packet that spent every hop
+  getting here — the most-travelled packets are exactly the ones whose hop count
+  used to come out NULL.
+
+  This is also the arithmetic the firmware uses to maintain a node's hops_away
+  (NodeDB.cpp:1946), so one packet's answer is the freshest reading available for
+  nodes.hops_away as well as the hop count on a message row.
+  """
+  hop_start = packet.get("hopStart")
+  hop_limit = packet.get("hopLimit")
+
+  if hop_start is None or hop_limit is None:
+    return None
+
+  return hop_start - hop_limit
+
+
+
+
 def _identity_label(row: dict) -> str:
   """Render a node row's identity for the log — "Foo Bar (FOO)" when it has
   both names, whichever one it has when it has one, "unnamed" when it has
@@ -636,6 +658,13 @@ class MeshtasticCollector:
       # honest fallback here, and only here; node dicts carry lastHeard or
       # nothing.
       "lastHeard": packet.get("rxTime") or int(time.time()),
+      "hopsAway": _hops_taken(packet),
+      # Deliberately coerced to a real bool rather than passed through. The
+      # library drops proto fields sitting at their default, so a plain LoRa
+      # packet carries no viaMqtt key at all — and for a packet, absence *is*
+      # the answer, not a lack of one. Node dicts get no such default applied
+      # (see _apply_node_update): there, absence really is silence.
+      "viaMqtt": bool(packet.get("viaMqtt", False)),
       "_source": "packet",
     }
 
@@ -671,6 +700,11 @@ class MeshtasticCollector:
         "shortName": user.get("shortName"),
         "hwModel": user.get("hwModel"),
         "role": user.get("role"),
+        # Named unconditionally so the key is always present here, which is
+        # what lets _apply_node_update tell "this NODEINFO carried no key"
+        # from "no NODEINFO has ever arrived". Only presence survives into
+        # the archive; the key bytes stop at this dict.
+        "publicKey": user.get("publicKey"),
       }
 
     self._on_node_update(normalized)
@@ -797,6 +831,17 @@ class MeshtasticCollector:
     environment = node_data.get("environmentMetrics", {})
     position = node_data.get("position", {})
 
+    # Three states, and the difference between two of them matters: 1 the node
+    # published a PKI key, 0 a NODEINFO this collector decoded carried none,
+    # None nothing has ever said either way. Hence `in` rather than `.get()` —
+    # the NODEINFO branch always writes the key, so its absence here means no
+    # NODEINFO reached us, and a bare row built from a telemetry packet must
+    # not be filed as a node that declined PKI. Presence is all that is kept;
+    # the key bytes go no further than this comparison.
+    has_public_key = (
+      bool(user_data.get("publicKey")) if "publicKey" in user_data else None
+    )
+
     merged = self._merge_node_data(existing, {
       "short_name": user_data.get("shortName"),
       "long_name": user_data.get("longName"),
@@ -816,6 +861,14 @@ class MeshtasticCollector:
       "latitude": position.get("latitude"),
       "longitude": position.get("longitude"),
       "altitude": position.get("altitude"),
+      # Node dicts carry hopsAway themselves; a packet's is derived from its
+      # hop headers, which is the same number by the same arithmetic.
+      "hops_away": node_data.get("hopsAway"),
+      "via_mqtt": node_data.get("viaMqtt"),
+      "has_public_key": has_public_key,
+      "lux": environment.get("lux"),
+      "iaq": environment.get("iaq"),
+      "gas_resistance": environment.get("gasResistance"),
     })
 
     self.storage.upsert_node(node_id=node_id, is_new=is_new_node, **merged)
@@ -857,6 +910,8 @@ class MeshtasticCollector:
       "temperature", "humidity", "pressure",
       "channel_util", "air_util_tx", "uptime_seconds",
       "latitude", "longitude", "altitude",
+      "hops_away", "via_mqtt", "has_public_key",
+      "lux", "iaq", "gas_resistance",
     ):
       old = existing.get(key)
       new = merged.get(key)
@@ -938,16 +993,7 @@ class MeshtasticCollector:
     rx_time = packet.get("rxTime", int(time.time()))
     snr = packet.get("rxSnr")
     rssi = packet.get("rxRssi")
-    hop_start = packet.get("hopStart")
-    hop_limit = packet.get("hopLimit")
-    # `is not None`, not truthiness: hopLimit is 0 on a packet that spent
-    # every hop getting here — the most-travelled messages are exactly the
-    # ones whose hop count used to come out NULL.
-    hop_count = (
-      hop_start - hop_limit
-      if hop_start is not None and hop_limit is not None
-      else None
-    )
+    hop_count = _hops_taken(packet)
     channel_index = packet.get("channel", 0)
     reply_to = decoded.get("replyId")
     via_mqtt = packet.get("viaMqtt", False)
@@ -1042,7 +1088,9 @@ class MeshtasticCollector:
       "last_seen", "battery_level", "voltage", "snr", "rssi",
       "temperature", "humidity", "pressure",
       "channel_util", "air_util_tx", "uptime_seconds",
-      "latitude", "longitude", "altitude"
+      "latitude", "longitude", "altitude",
+      "hops_away", "via_mqtt", "has_public_key",
+      "lux", "iaq", "gas_resistance"
     ]
 
     for field in fields:

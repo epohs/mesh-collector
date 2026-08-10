@@ -327,6 +327,12 @@ class Storage:
     channel_util: Optional[float] = None,
     air_util_tx: Optional[float] = None,
     uptime_seconds: Optional[int] = None,
+    hops_away: Optional[int] = None,
+    via_mqtt: Optional[bool] = None,
+    has_public_key: Optional[bool] = None,
+    lux: Optional[float] = None,
+    iaq: Optional[int] = None,
+    gas_resistance: Optional[float] = None,
     *,
     is_new: bool = False,
   ) -> None:
@@ -343,8 +349,10 @@ class Storage:
              (node_id, short_name, long_name, hardware, role, last_seen,
               battery_level, voltage, snr, rssi, latitude, longitude, altitude,
               temperature, humidity, pressure, channel_util, air_util_tx,
-              uptime_seconds)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              uptime_seconds, hops_away, via_mqtt, has_public_key, lux, iaq,
+              gas_resistance)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                     ?, ?, ?, ?, ?, ?)
              ON CONFLICT(node_id) DO UPDATE SET
              short_name = COALESCE(excluded.short_name, short_name),
              long_name = COALESCE(excluded.long_name, long_name),
@@ -363,13 +371,20 @@ class Storage:
              pressure = COALESCE(excluded.pressure, pressure),
              channel_util = COALESCE(excluded.channel_util, channel_util),
              air_util_tx = COALESCE(excluded.air_util_tx, air_util_tx),
-             uptime_seconds = COALESCE(excluded.uptime_seconds, uptime_seconds)
+             uptime_seconds = COALESCE(excluded.uptime_seconds, uptime_seconds),
+             hops_away = COALESCE(excluded.hops_away, hops_away),
+             via_mqtt = COALESCE(excluded.via_mqtt, via_mqtt),
+             has_public_key = COALESCE(excluded.has_public_key, has_public_key),
+             lux = COALESCE(excluded.lux, lux),
+             iaq = COALESCE(excluded.iaq, iaq),
+             gas_resistance = COALESCE(excluded.gas_resistance, gas_resistance)
           """,
           (
             node_id, short_name, long_name, hardware, role, last_seen,
             battery_level, voltage, snr, rssi, latitude, longitude, altitude,
             temperature, humidity, pressure, channel_util, air_util_tx,
-            uptime_seconds,
+            uptime_seconds, hops_away, via_mqtt, has_public_key, lux, iaq,
+            gas_resistance,
           ),
         )
 
