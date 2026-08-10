@@ -40,6 +40,15 @@ config.json
 gunicorn.conf.py
 
 
+# Deploy guide rendered by scripts/mesh_setup.py for one particular install.
+# The tracked templates are deploy/*.example; this is the filled-in result, and it
+# carries that machine's paths, service user and hostname — which this being a
+# public repo makes a reason on its own. Unanchored because mesh_setup.py chooses
+# the location at runtime (see its `deploy_base`): normally <collector>/scripts,
+# but beside the script itself when run against a reused checkout.
+deploy-guide/
+
+
 # Environments
 .env
 .envrc
