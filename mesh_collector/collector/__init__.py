@@ -12,7 +12,7 @@ import sqlite3
 
 from typing import Optional
 
-from meshtastic.protobuf import mesh_pb2, storeforward_pb2, telemetry_pb2
+from meshtastic.protobuf import mesh_pb2, portnums_pb2, storeforward_pb2, telemetry_pb2
 from meshtastic.serial_interface import SerialInterface
 from pubsub import pub
 
@@ -513,14 +513,23 @@ class MeshtasticCollector:
 
     want_ack = request.resolve_want_ack()
 
+    # A reaction is a reply carrying a flag, so asked for without a reply_to it is
+    # not something the protocol can express. The flag is dropped rather than
+    # honoured, and the archive records the 0 that matches what actually went out
+    # instead of a 1 describing a packet nobody sent.
+    is_reaction = bool(request.emoji) and request.reply_to is not None
+
     try:
-      packet = self.interface.sendText(
-        text=request.text,
-        destinationId=request.destination,
-        channelIndex=request.channel_index,
-        wantAck=want_ack,
-        replyId=request.reply_to,
-      )
+      if is_reaction:
+        packet = self._transmit_reaction(request, want_ack)
+      else:
+        packet = self.interface.sendText(
+          text=request.text,
+          destinationId=request.destination,
+          channelIndex=request.channel_index,
+          wantAck=want_ack,
+          replyId=request.reply_to,
+        )
     except Exception as e:
       logging.exception("Send failed for destination %s", request.destination)
       pending.fail(ERR_SEND_FAILED, f"The radio refused the message: {e}")
@@ -541,7 +550,9 @@ class MeshtasticCollector:
       })
       return
 
-    archived, rx_time = self._archive_outbound(request, message_id, is_direct)
+    archived, rx_time = self._archive_outbound(
+      request, message_id, is_direct, is_reaction
+    )
 
     logging.info(
       "TX %s %s: %s",
@@ -562,8 +573,54 @@ class MeshtasticCollector:
 
 
 
+  def _transmit_reaction(self, request, want_ack: bool):
+    """Send a reaction, which `sendText` cannot express.
+
+    The flag that makes a reply a reaction is `emoji` on meshtastic's `Data`, and
+    neither `sendText` nor the `sendData` under it takes an argument for it — 2.7.11
+    passes `replyId` through and stops there. The field is in the protobuf, so the
+    only thing missing is a way to set it, and that is what this is.
+
+    Deliberately not a rewrite of the ordinary path. `sendText` still sends every
+    message that is not a reaction, because this reaches past the library's public
+    surface into `_generatePacketId` and `_sendPacket`, and confining that to
+    reactions keeps a version of meshtastic that moves those from breaking sends
+    outright — it would break tapbacks, and the rest would carry on.
+
+    Mirrors what `sendData` does with the same inputs, priority included, so a
+    reaction is an ordinary text packet in every respect except the one flag. The
+    payload length check is the library's own, kept because this no longer runs
+    through the code that raises it.
+    """
+    payload = request.text.encode("utf-8")
+    if len(payload) > mesh_pb2.Constants.DATA_PAYLOAD_LEN:
+      raise ValueError(
+        f"A reaction of {len(payload)} bytes does not fit in one packet; "
+        f"the limit is {mesh_pb2.Constants.DATA_PAYLOAD_LEN}."
+      )
+
+    packet = mesh_pb2.MeshPacket()
+    packet.channel = request.channel_index
+    packet.decoded.portnum = portnums_pb2.PortNum.TEXT_MESSAGE_APP
+    packet.decoded.payload = payload
+    packet.decoded.want_response = False
+    packet.decoded.reply_id = request.reply_to
+    packet.decoded.emoji = 1
+    packet.id = self.interface._generatePacketId()
+
+    # sendData's default, applied here because that default lives in a signature
+    # this call does not go through.
+    packet.priority = 70
+
+    return self.interface._sendPacket(
+      packet, request.destination, wantAck=want_ack
+    )
+
+
+
+
   def _archive_outbound(
-    self, request, message_id: int, is_direct: bool
+    self, request, message_id: int, is_direct: bool, is_reaction: bool = False
   ) -> tuple[bool, int]:
     """Write the row for a message this collector just sent.
 
@@ -596,13 +653,16 @@ class MeshtasticCollector:
           rssi=None,
           reply_to=request.reply_to,
           via_mqtt=False,
-          # 0, not NULL: this row's flag is known, and it is known to be false.
-          # mesh-link's SendTextRequest has no emoji field, so nothing can ask
-          # this collector to transmit a tapback — an outbound row with a
-          # reply_to is a genuine reply, never a reaction. NULL here would mean
-          # "written before the flag existed", which is a different claim and an
-          # untrue one for a row being written now.
-          emoji=0,
+          # 0 or 1, never NULL: this row's flag is known either way, because this
+          # collector is the one that just chose it. NULL means "written before the
+          # flag existed", which is a different claim and an untrue one for a row
+          # being written now.
+          #
+          # `is_reaction` rather than `request.emoji`, so the row agrees with the
+          # packet: a flag asked for without a reply_to was dropped on the way out,
+          # and recording the request instead of the transmission would leave an
+          # archive saying a reaction was sent when a plain message was.
+          emoji=1 if is_reaction else 0,
         )
         return inserted, rx_time
 
@@ -618,7 +678,7 @@ class MeshtasticCollector:
         rssi=None,
         reply_to=request.reply_to,
         via_mqtt=False,
-        emoji=0,
+        emoji=1 if is_reaction else 0,
       )
       return inserted, rx_time
 
