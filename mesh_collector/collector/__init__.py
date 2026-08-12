@@ -82,6 +82,33 @@ def _first_value(source: dict, *keys):
 
 
 
+def _sender_id(packet: dict) -> Optional[str]:
+  """Who sent this packet, as a node_id, or None if not even the header says.
+
+  `fromId` is the library's own resolution of the sender's number against the
+  device NodeDB, so it is absent for any node the device cannot yet name — and
+  it is absent for *every* node on a channel this radio has no key for, since
+  the NODEINFO that would have named them was unreadable too.
+
+  The number survives that: it rides in the packet header, outside everything
+  the channel PSK covers, so an undecryptable packet still says who sent it.
+  Hence the fallback rather than giving up when `fromId` is missing. A `from` of
+  zero is not a sender — the proto omits a field at its default, so absent and
+  zero arrive identically and neither one names a node.
+  """
+  from_id = packet.get("fromId")
+  if from_id:
+    return from_id
+
+  raw_from = packet.get("from")
+  if not raw_from:
+    return None
+
+  return node_num_to_hex_id(raw_from)
+
+
+
+
 def _hops_taken(packet: dict) -> Optional[int]:
   """How many hops this packet spent getting here, or None if it can't be known.
 
@@ -672,21 +699,32 @@ class MeshtasticCollector:
 
       if channel_hash not in self._undecryptable_seen:
         self._undecryptable_seen.add(channel_hash)
+        # The sender is named because the hash on its own cannot separate the two
+        # diagnoses, and they have opposite fixes: a neighbour talking on a
+        # channel we were never given (nothing to do) versus one of our own
+        # channels whose PSK has drifted on one side (fix the key). Comparing the
+        # hash against the hash of each configured channel answers it — and when
+        # it comes back "none of ours", the sender is the only remaining thread
+        # to pull.
+        #
+        # Deliberately "first from": this fires once per hash for the life of the
+        # process, so it names whichever node opened the account, not the one
+        # doing the most talking. Expect an id that appears nowhere else — the
+        # branch returns without a row for exactly the reason above, so there is
+        # no `nodes` entry and no name to look up, and that is not a bug in this
+        # line.
         logging.info(
-          "Undecryptable packet on channel hash 0x%02x%s — this radio has no "
-          "key for that channel; a wrong PSK looks exactly like this",
+          "Undecryptable packet on channel hash 0x%02x, first from %s%s — this "
+          "radio has no key for that channel; a wrong PSK looks exactly like this",
           channel_hash,
+          _sender_id(packet) or "an unidentified sender",
           " (via mqtt)" if via_mqtt else "",
         )
 
       self._maybe_log_rx_summary()
       return
 
-    from_node_id = packet.get("fromId")
-    if not from_node_id:
-      raw_from = packet.get("from")
-      if raw_from:
-        from_node_id = f"!{raw_from & 0xFFFFFFFF:08x}"
+    from_node_id = _sender_id(packet)
 
     if not from_node_id:
       logging.debug("Packet without node_id; skipping")
