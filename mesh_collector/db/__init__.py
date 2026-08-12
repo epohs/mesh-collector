@@ -17,6 +17,33 @@ SCHEMA_FILE = Path(__file__).parent / "schema.sql"
 
 
 
+# In-place upgrades, keyed by the version an archive is *at*: each rung names the
+# version it arrives at and the statements that get it there.
+#
+# Only MINOR bumps belong here, and only the additive kind schema.sql already
+# promises readers — ALTER TABLE ADD COLUMN and nothing else. That restriction is
+# what makes a rung safe to apply without understanding the rows: adding a column
+# cannot lose data, cannot reinterpret a value, and leaves every existing reader
+# correct. Anything that rewrites or drops is a MAJOR bump and takes the rebuild
+# path, where the operator has to authorize the loss explicitly.
+#
+# A ladder rather than a map so multiple versions can be crossed in one startup:
+# a 0.9.0 archive meeting a future 0.11.0 walks 0.9.0 -> 0.10.0 -> 0.11.0. A
+# version with no rung is not an error here — it simply falls through to the
+# rebuild gate, which is where an unrecognized or foreign database belongs.
+#
+# Added columns get no DEFAULT on purpose. An upgraded row's value is unknown,
+# and NULL is how this schema says so; see the `emoji` prose in schema.sql.
+_UPGRADES: dict[str, tuple[str, list[str]]] = {
+  "0.9.0": ("0.10.0", [
+    "ALTER TABLE messages ADD COLUMN emoji INTEGER",
+    "ALTER TABLE direct_messages ADD COLUMN emoji INTEGER",
+  ]),
+}
+
+
+
+
 class SchemaVersionMismatch(RuntimeError):
   """Raised when the database predates schema.sql and a rebuild wasn't authorized."""
 
@@ -82,11 +109,17 @@ class Storage:
 
 
 
-  def _backup_database(self) -> Path:
+  def _backup_database(self, reason: str = "pre-rebuild") -> Path:
     """Write a timestamped copy of the database beside it, and return its path.
 
     Uses VACUUM INTO rather than a file copy so the snapshot is consistent even
     though the database is in WAL mode.
+
+    `reason` only names the backup in the log. It exists because there are now
+    two callers wanting very different things from the same file: a rebuild is
+    about to destroy this archive, an in-place upgrade is about to alter it and
+    expects to succeed. Someone reading the journal afterwards needs to know
+    which one they are looking at.
     """
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     backup_path = self.db_path.with_name(f"{self.db_path.name}.{stamp}.bak")
@@ -95,18 +128,97 @@ class Storage:
       raise FileExistsError(f"Refusing to overwrite existing backup {backup_path}")
 
     self.conn.execute("VACUUM INTO ?", (str(backup_path),))
-    logging.warning("Wrote pre-rebuild backup to %s", backup_path)
+    logging.warning("Wrote %s backup to %s", reason, backup_path)
 
     return backup_path
 
 
 
 
-  def _initialize_or_upgrade_database(self) -> None:
-    """Create the schema, or rebuild the database if the schema version changed.
+  def _plan_upgrade(self, db_version: str, schema_version: str) -> Optional[list[tuple[str, list[str]]]]:
+    """Walk _UPGRADES from `db_version` and return the rungs reaching `schema_version`.
 
-    A rebuild drops every table, so on an existing database it happens only when
-    ALLOW_DESTRUCTIVE_REBUILD is set, and only after a backup has been written.
+    Returns None when the ladder cannot get there — a missing rung, or a chain
+    that stops short — and None means "not upgradable in place", which is the
+    rebuild gate's business rather than an error here.
+
+    The whole path is resolved before anything is applied, deliberately. Applying
+    rungs as they are found would let a chain that runs out halfway leave the
+    archive at a version no reader has ever been told about, with a rebuild as
+    the only way back. Either every rung applies or none do.
+    """
+    rungs: list[tuple[str, list[str]]] = []
+    version = db_version
+    # Bounded by the ladder's own size: every step consumes a distinct key, so a
+    # cycle (0.9.0 -> 0.10.0 -> 0.9.0, written by hand one day) terminates here
+    # instead of spinning.
+    for _ in range(len(_UPGRADES)):
+      if version == schema_version:
+        return rungs
+      rung = _UPGRADES.get(version)
+      if rung is None:
+        return None
+      version, statements = rung
+      rungs.append((version, statements))
+
+    return rungs if version == schema_version else None
+
+
+
+
+  def _upgrade_in_place(self, db_version: str, rungs: list[tuple[str, list[str]]]) -> None:
+    """Apply resolved upgrade rungs to the existing database, keeping its rows.
+
+    A backup is written first and the whole ladder runs in one transaction, so
+    the archive is either fully upgraded or untouched. If a statement fails —
+    the column already exists, say, because someone patched it by hand — the
+    exception propagates and the collector refuses to start. That is the right
+    end: the backup is on disk, and a half-understood archive should not be
+    written to.
+    """
+    self._backup_database("pre-upgrade")
+
+    with self.conn:
+      # sqlite3 opens a transaction implicitly only ahead of DML, so these ALTERs
+      # would otherwise each commit on their own and a failure on the second rung
+      # would leave the first applied with no version to describe it. SQLite's DDL
+      # is transactional; Python's driver just needs telling.
+      self.conn.execute("BEGIN")
+
+      version = db_version
+      for target, statements in rungs:
+        for statement in statements:
+          self.conn.execute(statement)
+        # Stamped per rung rather than once at the end. Not for crash safety —
+        # the transaction above means an interrupted ladder rolls back to the
+        # version it started at, stamps and all — but so that each rung is a
+        # complete step on its own terms: statements, then the version that
+        # describes them. A rung that is added later and forgets its stamp is
+        # then a visible omission rather than an invisible one.
+        self.conn.execute(
+          "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
+          (target,)
+        )
+        logging.info(
+          "Upgraded database in place: %s -> %s (archive preserved)", version, target
+        )
+        version = target
+
+
+
+
+  def _initialize_or_upgrade_database(self) -> None:
+    """Create the schema, upgrade the database in place, or rebuild it.
+
+    Three outcomes, in order of preference. A version this code knows how to
+    reach by adding columns is upgraded in place and keeps every row. Anything
+    else is a rebuild, which drops every table, so on an existing database it
+    happens only when ALLOW_DESTRUCTIVE_REBUILD is set and only after a backup.
+
+    The in-place path is tried first and deliberately narrowly: it handles the
+    additive MINOR bumps schema.sql promises readers, and declines everything
+    else rather than guessing. Declining costs nothing — the rebuild gate below
+    is exactly where a database this code does not recognize should land.
     """
     schema_version = self._read_schema_version()
     db_version = self._get_db_schema_version()
@@ -124,11 +236,22 @@ class Storage:
       "AND name NOT LIKE 'sqlite_%' LIMIT 1"
     ).fetchone() is not None
 
+    # A fresh database is never upgraded, only built: it has no rows to preserve,
+    # and "0.0.0" is the same answer a foreign database gives, so a rung keyed on
+    # it would run ALTER TABLE against tables that do not exist.
+    if is_existing_database:
+      rungs = self._plan_upgrade(db_version, schema_version)
+      if rungs:
+        self._upgrade_in_place(db_version, rungs)
+        return
+
     if is_existing_database and not Config.get("ALLOW_DESTRUCTIVE_REBUILD", False):
       raise SchemaVersionMismatch(
         f"Database at {self.db_path} is schema version {db_version}, but "
-        f"schema.sql is {schema_version}. Upgrading rebuilds the database from "
-        "scratch and discards every node and message it holds.\n"
+        f"schema.sql is {schema_version}. That is not a difference this code can "
+        "settle by adding columns, so there is no in-place upgrade for it: "
+        "upgrading rebuilds the database from scratch and discards every node "
+        "and message it holds.\n"
         "\n"
         "To keep the archive, point DB_PATH at a database built by this version, "
         "or downgrade to the code that wrote this one.\n"
@@ -232,18 +355,24 @@ class Storage:
     rssi: Optional[int],
     reply_to: Optional[int] = None,
     via_mqtt: bool = False,
+    emoji: Optional[int] = None,
   ) -> bool:
     """Insert channel message and periodically prune old messages.
 
     Returns True if inserted, False if duplicate.
+
+    `emoji` defaults to None rather than 0 so that a caller which has not been
+    taught about the flag writes "unknown" instead of asserting "not a reaction".
+    Every caller in this project passes it explicitly; the default is for the one
+    that gets written next.
     """
     with self._lock:
       with self.conn:
         cursor = self.conn.execute(
           """INSERT OR IGNORE INTO messages
-             (message_id, channel_index, from_node, to_node, text, rx_time, hop_count, snr, rssi, reply_to, via_mqtt)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-          (message_id, channel_index, from_node, to_node, text, rx_time, hop_count, snr, rssi, reply_to, int(via_mqtt)),
+             (message_id, channel_index, from_node, to_node, text, rx_time, hop_count, snr, rssi, reply_to, via_mqtt, emoji)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+          (message_id, channel_index, from_node, to_node, text, rx_time, hop_count, snr, rssi, reply_to, int(via_mqtt), emoji),
         )
         inserted = cursor.rowcount > 0
 
@@ -269,18 +398,20 @@ class Storage:
     rssi: Optional[int],
     reply_to: Optional[int] = None,
     via_mqtt: bool = False,
+    emoji: Optional[int] = None,
   ) -> bool:
     """Insert direct message and periodically prune old messages.
 
-    Returns True if inserted, False if duplicate.
+    Returns True if inserted, False if duplicate. `emoji` carries the same
+    tri-state as insert_message's, for the same reasons.
     """
     with self._lock:
       with self.conn:
         cursor = self.conn.execute(
           """INSERT OR IGNORE INTO direct_messages
-             (message_id, from_node, to_node, text, rx_time, snr, rssi, reply_to, via_mqtt)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-          (message_id, from_node, to_node, text, rx_time, snr, rssi, reply_to, int(via_mqtt)),
+             (message_id, from_node, to_node, text, rx_time, snr, rssi, reply_to, via_mqtt, emoji)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+          (message_id, from_node, to_node, text, rx_time, snr, rssi, reply_to, int(via_mqtt), emoji),
         )
         inserted = cursor.rowcount > 0
 

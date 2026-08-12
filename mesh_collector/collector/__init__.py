@@ -27,6 +27,25 @@ LOG_FORMAT = "[%(levelname)s] %(message)s"
 # spinning.
 CONTROL_POLL_INTERVAL = 1.0
 
+# How often the receive path accounts for what it threw away, and how many drops
+# it will sit on before saying so early.
+#
+# Both exist because of a question this collector could not answer: a channel
+# with no messages on it looks exactly like a channel whose PSK is wrong. Packets
+# this radio cannot decrypt are dropped without a word at any level, so "quiet
+# mesh" and "misconfigured key" produced identical logs — and the only way to
+# tell them apart was to walk up to the radio.
+#
+# Fifteen minutes because the line is meant to be read after the fact, by
+# somebody grepping a day of journal for it, and one line per quarter hour is
+# cheap enough to leave on forever. The drop threshold is what makes it useful
+# in the other direction: a radio being shouted at by a channel it cannot read
+# reaches fifty drops long before the window closes, and waiting the rest of the
+# window to mention it wastes the operator's time while they are standing there
+# watching.
+RX_SUMMARY_INTERVAL = 900
+RX_SUMMARY_MAX_DROPS = 50
+
 
 
 
@@ -137,6 +156,33 @@ class MeshtasticCollector:
 
     self.transmit_enabled: bool = bool(Config.get("ENABLE_TX", False))
     self.control_server = None
+
+    # What the receive path dropped, since the last summary was logged.
+    #
+    # Plain dicts with no lock. Every write below happens on meshtastic's single
+    # reader thread, which is also the only place they are read — the main thread
+    # runs the control drain and never touches these. A lock here would be
+    # protecting a structure from itself.
+    #
+    # _undecryptable_counts is keyed by the packet's channel **hash**, not a
+    # channel index: an encrypted packet's header carries a one-byte hash of the
+    # channel name and PSK, and the index only exists after a successful decrypt.
+    # The two are not interchangeable and the hash must never be written to
+    # channel_index — it is a label for the log and nothing else. Two channels
+    # can even collide onto one hash, which is why the log calls it a hash and
+    # quotes it in hex rather than pretending to name a channel.
+    self._undecryptable_counts: dict[int, int] = {}
+    self._undecryptable_mqtt = 0
+    # Channel hashes already reported once, so the explanatory line fires on
+    # first sighting and not forty times a minute afterwards. Never cleared by
+    # the summary reset — first sighting means first this process, not first
+    # this window.
+    self._undecryptable_seen: set[int] = set()
+    # Keyed (channel_index, portnum). Not dropped exactly — the node row still
+    # updates — but not archived either, and a channel carrying nothing but
+    # position packets is the other honest explanation for an empty message list.
+    self._nontext_counts: dict[tuple[int, str], int] = {}
+    self._rx_summary_at = time.time()
 
 
 
@@ -523,6 +569,13 @@ class MeshtasticCollector:
           rssi=None,
           reply_to=request.reply_to,
           via_mqtt=False,
+          # 0, not NULL: this row's flag is known, and it is known to be false.
+          # mesh-link's SendTextRequest has no emoji field, so nothing can ask
+          # this collector to transmit a tapback — an outbound row with a
+          # reply_to is a genuine reply, never a reaction. NULL here would mean
+          # "written before the flag existed", which is a different claim and an
+          # untrue one for a row being written now.
+          emoji=0,
         )
         return inserted, rx_time
 
@@ -538,6 +591,7 @@ class MeshtasticCollector:
         rssi=None,
         reply_to=request.reply_to,
         via_mqtt=False,
+        emoji=0,
       )
       return inserted, rx_time
 
@@ -599,6 +653,33 @@ class MeshtasticCollector:
       # skips its own NodeDB update for the same packets. NEIGHBORINFO_APP
       # and TRACEROUTE_APP are excluded on the same principle: they name
       # nodes this radio has not heard from directly.
+      #
+      # Dropping it silently was the oversight, and it cost an afternoon: with
+      # no line at any level, a channel the radio has no key for reads as a
+      # channel nobody is talking on. It is counted now, and the first packet
+      # per channel hash says out loud what the counter means.
+      # Defaulted to 0 like every other read of this field: the proto omits a
+      # field sitting at its default, so an absent `channel` is hash 0x00 and
+      # not a missing answer.
+      channel_hash = packet.get("channel", 0)
+      via_mqtt = bool(packet.get("viaMqtt", False))
+
+      self._undecryptable_counts[channel_hash] = (
+        self._undecryptable_counts.get(channel_hash, 0) + 1
+      )
+      if via_mqtt:
+        self._undecryptable_mqtt += 1
+
+      if channel_hash not in self._undecryptable_seen:
+        self._undecryptable_seen.add(channel_hash)
+        logging.info(
+          "Undecryptable packet on channel hash 0x%02x%s — this radio has no "
+          "key for that channel; a wrong PSK looks exactly like this",
+          channel_hash,
+          " (via mqtt)" if via_mqtt else "",
+        )
+
+      self._maybe_log_rx_summary()
       return
 
     from_node_id = packet.get("fromId")
@@ -646,6 +727,21 @@ class MeshtasticCollector:
       self._handle_text_message(packet, from_node_id)
       # No return: a message is also evidence the sender is alive, so its
       # receive metrics land on the node row below like any other packet.
+    else:
+      # Counted for the same reason the undecryptable drop above is. This radio
+      # archives text and nothing else, so a channel carrying only position or
+      # telemetry frames produces an empty message list while being perfectly
+      # busy — and that is a different diagnosis from a wrong key, reached by
+      # reading the same summary line.
+      #
+      # `channel` is a real index here: this packet decrypted, so the field is
+      # the channel it came in on rather than the hash the branch above deals
+      # with. UNKNOWN_APP stands in when the proto omits the portnum, which is
+      # the library's own convention.
+      key = (packet.get("channel", 0), portnum or "UNKNOWN_APP")
+      self._nontext_counts[key] = self._nontext_counts.get(key, 0) + 1
+
+    self._maybe_log_rx_summary()
 
     # Normalize packet into node_data shape
     normalized = {
@@ -708,6 +804,71 @@ class MeshtasticCollector:
       }
 
     self._on_node_update(normalized)
+
+
+
+
+  def _maybe_log_rx_summary(self) -> None:
+    """Account for what the receive path dropped, once a window, on one line.
+
+    Called from the receive path rather than from a timer, so it runs on the
+    same thread that owns the counters and needs no lock. The cost is that a
+    radio hearing nothing at all never emits — which is right: the line reports
+    traffic that arrived and was not archived, and none arriving is not that.
+
+    Emitted only when there is something to say. An all-zero summary every
+    fifteen minutes would be noise in the exact log somebody is grepping, and
+    would make the presence of the line meaningless — the point is that seeing
+    it at all tells you packets are being dropped.
+    """
+    now = time.time()
+    total_drops = sum(self._undecryptable_counts.values()) + sum(self._nontext_counts.values())
+
+    if not total_drops:
+      # Nothing to report, but the window still turns over, so a quiet quarter
+      # hour doesn't leave the next drop looking like it took an hour to arrive.
+      if now - self._rx_summary_at >= RX_SUMMARY_INTERVAL:
+        self._rx_summary_at = now
+      return
+
+    window = now - self._rx_summary_at
+    if window < RX_SUMMARY_INTERVAL and total_drops < RX_SUMMARY_MAX_DROPS:
+      return
+
+    clauses = []
+
+    if self._undecryptable_counts:
+      # Sorted by count, worst first: with several hashes in play the one being
+      # shouted at is the one worth reading, and it should not depend on which
+      # hash happens to sort lower.
+      parts = ", ".join(
+        f"ch-hash 0x{channel_hash:02x} x{count}"
+        for channel_hash, count in sorted(
+          self._undecryptable_counts.items(), key=lambda item: -item[1]
+        )
+      )
+      mqtt = f" ({self._undecryptable_mqtt} mqtt)" if self._undecryptable_mqtt else ""
+      clauses.append(f"undecryptable {parts}{mqtt}")
+
+    if self._nontext_counts:
+      parts = ", ".join(
+        f"ch{channel_index} {portnum} x{count}"
+        for (channel_index, portnum), count in sorted(
+          self._nontext_counts.items(), key=lambda item: -item[1]
+        )
+      )
+      clauses.append(f"non-text {parts}")
+
+    # One line, no newlines, no quoted fields — deliberately, so _TidyLogFilter
+    # passes it through untouched (it rewrites multi-line records and records
+    # carrying `field: "..."` byte fields) and so `grep 'RX summary'` over a
+    # day of journal returns one row per window.
+    logging.info("RX summary (last %ds): %s", round(window), "; ".join(clauses))
+
+    self._undecryptable_counts.clear()
+    self._undecryptable_mqtt = 0
+    self._nontext_counts.clear()
+    self._rx_summary_at = now
 
 
 
@@ -998,6 +1159,19 @@ class MeshtasticCollector:
     reply_to = decoded.get("replyId")
     via_mqtt = packet.get("viaMqtt", False)
 
+    # The firmware's own answer to "is this a reaction?", which until 0.10.0 this
+    # collector threw away and both readers guessed at by looking for a message
+    # whose text is nothing but an emoji. The guess is wrong in both directions:
+    # a deliberate one-emoji reply reads as a tapback, and a client that reacts
+    # with 🏓 or a skin-toned thumb may not.
+    #
+    # Coerced to 0/1 rather than stored raw. The proto drops fields at their
+    # default, so an absent key is a genuine "not a reaction" and not silence —
+    # the same reasoning viaMqtt gets above. Clients disagree on what they put
+    # in the field (1 in some, a codepoint in others), and this column answers
+    # only whether it is a reaction; the emoji itself is already in `text`.
+    emoji = 1 if decoded.get("emoji") else 0
+
     # A DM is a message addressed to this node; a channel message is one
     # addressed to everyone — this library always renders broadcast as
     # toId "^all", never "!ffffffff". Anything else is a DM between two other
@@ -1042,6 +1216,7 @@ class MeshtasticCollector:
           rssi=rssi,
           reply_to=reply_to,
           via_mqtt=via_mqtt,
+          emoji=emoji,
         )
         if inserted:
           logging.info("DM  %s: %s%s", from_node_id, text[:100], metrics)
@@ -1067,6 +1242,7 @@ class MeshtasticCollector:
           rssi=rssi,
           reply_to=reply_to,
           via_mqtt=via_mqtt,
+          emoji=emoji,
         )
         if inserted:
           logging.info("CH%d %s: %s%s", channel_index, from_node_id, text[:100], metrics)

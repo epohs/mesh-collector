@@ -1,4 +1,4 @@
--- schema_version: 0.9.0
+-- schema_version: 0.10.0
 
 -- -------------------
 -- What the version number promises
@@ -36,9 +36,25 @@
 -- 0.8.0 and both still read this archive correctly. A reader that wants the new
 -- columns raises its own constant when it starts selecting them, and not before.
 --
--- The collector itself is stricter, and has to be: it has no migrations, so any
--- difference between this file and an existing database means a rebuild. See
--- _initialize_or_upgrade_database().
+-- 0.10.0 adds `emoji` to `messages` and `direct_messages`, and this time both
+-- readers do move, because both select it to tell a tapback from an ordinary
+-- message. It is the first version whose MINOR reaches two digits, which is a
+-- trap only for code that compares these strings lexically — "0.10.0" sorts
+-- *below* "0.9.0" as text. Nothing does: both readers split on '.' and compare
+-- integer tuples (_parse_version), and the collector compares for equality
+-- only. Anything new that reads this number owes the same arithmetic.
+--
+-- The collector itself is stricter, and has to be, but it is no longer strict to
+-- the point of destroying the archive over an added column. It carries an
+-- upgrade ladder for MINOR bumps: a database whose version has a rung in
+-- _UPGRADES is altered in place, after a backup, and its rows are kept. Anything
+-- with no rung — a MAJOR bump, a version this code has never heard of, a foreign
+-- database — still means a rebuild, and still refuses to happen without
+-- ALLOW_DESTRUCTIVE_REBUILD. See _initialize_or_upgrade_database().
+--
+-- The ladder is what makes a MINOR bump honest. Additive-only was already the
+-- promise this file made to readers; until 0.10.0 the writer kept it by throwing
+-- the archive away, which satisfied the letter of it and nobody's expectations.
 --
 
 
@@ -186,6 +202,28 @@ CREATE TABLE IF NOT EXISTS channels (
 -- -------------------
 -- Channel messages table
 -- -------------------
+--
+-- `emoji` arrived in 0.10.0 and is deliberately tri-state. The firmware sets a
+-- flag beside the reply id to say "this text is a reaction to that message, not
+-- a message of its own", and until 0.10.0 this archive dropped it — leaving
+-- readers to guess from the text, which is only ever a guess: a reply that
+-- happens to be nothing but 👍 looks identical to a tapback.
+--
+--   NULL  Written before 0.10.0. The flag was not recorded, so it is unknown,
+--         and a reader must fall back to whatever heuristic it used before.
+--         **Never backfilled.** Guessing a value here would launder a guess
+--         into a fact, and the point of the column is to stop doing that.
+--   0     The flag was recorded and was not set: an ordinary message.
+--   1     The flag was recorded and was set: a reaction.
+--
+-- Read it with IS NULL, never with falsiness — 0 and NULL are different answers
+-- here, and only one of them is an answer.
+--
+-- Clients disagree on what they put in the field: some send 1, some send a
+-- codepoint. The collector stores any nonzero as 1, so this column means "is a
+-- reaction" and never "which emoji" — the emoji itself is in `text`, where it
+-- has always been.
+--
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id INTEGER UNIQUE,
@@ -198,7 +236,12 @@ CREATE TABLE IF NOT EXISTS messages (
     snr REAL,
     rssi REAL,
     reply_to INTEGER,
-    via_mqtt INTEGER DEFAULT 0
+    via_mqtt INTEGER DEFAULT 0,
+    -- Appended, and with no DEFAULT, for the same reason `nodes` appends: an
+    -- existing row upgraded in place gets NULL, which is exactly the "unknown"
+    -- this column needs to mean. A DEFAULT 0 would quietly assert that every
+    -- message ever archived was not a reaction.
+    emoji INTEGER
 );
 
 -- Covering index for channel message lists (filter, order, JOIN keys)
@@ -224,6 +267,11 @@ ON messages (reply_to);
 -- an inbound row carries the local node here, an outbound row carries the peer.
 -- Rows written before 0.7.0 do not exist — the version bump rebuilds.
 --
+-- `emoji` is the 0.10.0 column, tri-state, documented in full above `messages`.
+-- It is here because mesh-console selects both tables through one shared column
+-- list, so a column on one is a column on both whether or not tapbacks are as
+-- interesting in a DM thread.
+--
 CREATE TABLE IF NOT EXISTS direct_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id INTEGER UNIQUE,
@@ -234,7 +282,8 @@ CREATE TABLE IF NOT EXISTS direct_messages (
     snr REAL,
     rssi REAL,
     reply_to INTEGER,
-    via_mqtt INTEGER DEFAULT 0
+    via_mqtt INTEGER DEFAULT 0,
+    emoji INTEGER
 );
 
 -- Covering index for DM lists (order, JOIN keys)
