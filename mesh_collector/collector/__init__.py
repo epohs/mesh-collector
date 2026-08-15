@@ -201,6 +201,7 @@ class MeshtasticCollector:
     self.interface: Optional[SerialInterface] = None
     self._running = False
     self._connection_lost = False
+    self._stopping = False
     self.local_node_id: Optional[str] = None
     self.tracked_channels: list[int] = self._tracked_channel_indexes()
 
@@ -324,6 +325,17 @@ class MeshtasticCollector:
 
   def stop(self) -> None:
     logging.info("Stopping collector")
+
+    # Raised before the interface comes down, because closing it fires the same
+    # meshtastic.connection.lost event an unplug does — the library's reader
+    # thread exits either way and cannot say which it was. Without this flag
+    # every deliberate stop wrote _on_connection_lost's ERROR into the journal,
+    # so the one line that is supposed to mean "the radio vanished" also meant
+    # "somebody ran systemctl restart", which is exactly the boy-who-cried-wolf
+    # problem log levels exist to prevent. The event arrives on the reader
+    # thread mid-close(), strictly after this assignment, so the handler always
+    # sees it in time.
+    self._stopping = True
     self._running = False
 
     # Before the interface and the database, so a client cannot be granted a
@@ -836,6 +848,15 @@ class MeshtasticCollector:
     meshtastic publishes this with interface=, tolerated the same way
     _on_receive tolerates it.
     """
+    # Our own close fires this event too — the reader thread exits identically
+    # whether the device vanished or stop() dismissed it, and only this process
+    # knows which just happened. During a deliberate stop there is nothing to
+    # report ("Stopping collector" already said it) and nothing to do: stop()
+    # has the shutdown in hand, and setting _connection_lost here would turn a
+    # clean exit into the nonzero one that exists for unplugs.
+    if self._stopping:
+      return
+
     logging.error(
       "Serial connection lost on %s; shutting down so the service manager "
       "restarts this collector",
