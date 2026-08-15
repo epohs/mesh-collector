@@ -14,6 +14,7 @@ import urllib.request
 
 from typing import Optional
 
+from meshtastic.mesh_interface import MeshInterface
 from meshtastic.protobuf import mesh_pb2, portnums_pb2, storeforward_pb2, telemetry_pb2
 from meshtastic.serial_interface import SerialInterface
 from pubsub import pub
@@ -239,7 +240,35 @@ class MeshtasticCollector:
   def start(self) -> None:
     logging.info("Starting Meshtastic collector on %s", self.serial_port)
 
-    self.interface = SerialInterface(self.serial_port)
+    # **A missing device is a condition, not a crash.** Unplugging the radio —
+    # which a firmware update requires — used to print a thirty-line traceback
+    # here on every restart systemd scheduled, seconds apart, until the device
+    # came back: one real event, buried under forty copies of its own stack.
+    # The retry loop is systemd's and stays systemd's (Restart= is the
+    # reconnect policy, as the exit path below says); this is the same nonzero
+    # exit, said in one line a person can read.
+    #
+    # WARNING rather than ERROR, deliberately. The error is the unplug itself,
+    # and _on_connection_lost reported it once, at that level, when it
+    # happened; every failed reopen after it is the same ongoing condition,
+    # and forty ERRORs for one event teach a reader to skim past ERROR.
+    #
+    # OSError covers both the vanished /dev path (FileNotFoundError) and
+    # pyserial's SerialException, which subclasses it. MeshInterfaceError is
+    # the library's own "the port opened but no radio answered" — what a
+    # device sitting in its bootloader mid-flash looks like from here.
+    try:
+      self.interface = SerialInterface(self.serial_port)
+    except (OSError, MeshInterface.MeshInterfaceError) as error:
+      logging.warning(
+        "No Meshtastic device answered at %s (%s). It may be unplugged, "
+        "rebooting, or mid-flash; exiting so the service manager keeps "
+        "retrying until it returns.",
+        self.serial_port,
+        error,
+      )
+      self.storage.close()
+      sys.exit(1)
 
     self._sync_channels()
     self._initial_node_sync()
