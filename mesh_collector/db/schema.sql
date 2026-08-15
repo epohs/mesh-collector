@@ -1,4 +1,4 @@
--- schema_version: 0.10.0
+-- schema_version: 0.11.0
 
 -- -------------------
 -- What the version number promises
@@ -44,6 +44,14 @@
 -- integer tuples (_parse_version), and the collector compares for equality
 -- only. Anything new that reads this number owes the same arithmetic.
 --
+-- 0.11.0 adds no tables and no columns: it is two meta keys, firmware_version
+-- and firmware_channel, documented below. A version bump for two optional keys
+-- looks like ceremony, but the MINOR line above says "new meta keys" in so many
+-- words, and a convention kept only when it is convenient is not one. The rung
+-- in _UPGRADES is correspondingly empty — there is no ALTER to run, the stamp
+-- itself is the upgrade — and neither reader moves its floor, because both
+-- treat an absent key as "the collector never said" rather than as an error.
+--
 -- The collector itself is stricter, and has to be, but it is no longer strict to
 -- the point of destroying the archive over an added column. It carries an
 -- upgrade ladder for MINOR bumps: a database whose version has a rung in
@@ -79,6 +87,19 @@
 --                          client that can reach it. Optional: absent means
 --                          'false', which is what a reader must assume of any
 --                          archive written before this key existed.
+--   firmware_version       The attached device's firmware as it reports it —
+--                          version then build hash ('2.7.26.54e0d8d'). Optional,
+--                          and '' when the device did not say. Republished on
+--                          every startup, so a reflash shows up on the next
+--                          restart rather than never.
+--   firmware_channel       'beta' or 'alpha': which release channel that build
+--                          shipped on, per Meshtastic's own release listing.
+--                          The device does not know this about itself — the
+--                          collector looks it up online at startup — so '' or
+--                          absent means "could not say" (offline, an unlisted
+--                          build, an archive from before this key), and a
+--                          reader shows the version untagged rather than
+--                          guessing.
 --
 -- The collector republishes the policy keys on every startup, so they describe
 -- the archive as it is being written now. They are facts for readers to consult

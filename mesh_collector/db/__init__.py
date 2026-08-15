@@ -21,11 +21,17 @@ SCHEMA_FILE = Path(__file__).parent / "schema.sql"
 # version it arrives at and the statements that get it there.
 #
 # Only MINOR bumps belong here, and only the additive kind schema.sql already
-# promises readers — ALTER TABLE ADD COLUMN and nothing else. That restriction is
-# what makes a rung safe to apply without understanding the rows: adding a column
-# cannot lose data, cannot reinterpret a value, and leaves every existing reader
-# correct. Anything that rewrites or drops is a MAJOR bump and takes the rebuild
-# path, where the operator has to authorize the loss explicitly.
+# promises readers — ALTER TABLE ADD COLUMN, or nothing at all. That restriction
+# is what makes a rung safe to apply without understanding the rows: adding a
+# column cannot lose data, cannot reinterpret a value, and leaves every existing
+# reader correct. Anything that rewrites or drops is a MAJOR bump and takes the
+# rebuild path, where the operator has to authorize the loss explicitly.
+#
+# "Nothing at all" is a real rung, not a degenerate one: a MINOR bump that only
+# adds meta keys has no DDL to run, because meta rows are written by the running
+# collector rather than by this ladder. The rung still exists so the stamp moves
+# — an archive left reading 0.10.0 while carrying 0.11.0's keys would be lying
+# to readers about what they may find in it.
 #
 # A ladder rather than a map so multiple versions can be crossed in one startup:
 # a 0.9.0 archive meeting a future 0.11.0 walks 0.9.0 -> 0.10.0 -> 0.11.0. A
@@ -39,6 +45,9 @@ _UPGRADES: dict[str, tuple[str, list[str]]] = {
     "ALTER TABLE messages ADD COLUMN emoji INTEGER",
     "ALTER TABLE direct_messages ADD COLUMN emoji INTEGER",
   ]),
+  # 0.11.0 is meta keys only (firmware_version, firmware_channel), which the
+  # collector publishes itself at startup — see _publish_firmware.
+  "0.10.0": ("0.11.0", []),
 }
 
 

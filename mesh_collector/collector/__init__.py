@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import json
 import logging
 import os
 import re
@@ -9,6 +10,7 @@ import signal
 import sys
 import time
 import sqlite3
+import urllib.request
 
 from typing import Optional
 
@@ -45,6 +47,26 @@ CONTROL_POLL_INTERVAL = 1.0
 # watching.
 RX_SUMMARY_INTERVAL = 900
 RX_SUMMARY_MAX_DROPS = 50
+
+# Where the firmware release channel comes from. The device reports its version
+# with a build hash ('2.7.26.54e0d8d') and nothing else — whether that build is
+# a Beta or an Alpha is a fact about Meshtastic's release listing, not about the
+# radio, so it has to be looked up. GitHub's own API rather than
+# api.meshtastic.org/github/firmware/list, which was the obvious choice and was
+# rejected: that index carries only the newest couple of releases per channel,
+# so a device running last month's beta — the normal state of a device nobody
+# is reflashing weekly — silently loses its tag there. One page of a hundred
+# releases reaches back years; anything older than that is not going to be
+# classified usefully anyway, and a startup should not walk pages of a
+# rate-limited API on the off chance.
+#
+# Five seconds because this stands between the serial port opening and the main
+# loop: a startup should not hang on GitHub having a bad day, and the failure
+# mode is only an untagged version in a menu.
+FIRMWARE_RELEASES_URL = (
+  "https://api.github.com/repos/meshtastic/firmware/releases?per_page=100"
+)
+FIRMWARE_LOOKUP_TIMEOUT = 5
 
 
 
@@ -249,6 +271,7 @@ class MeshtasticCollector:
     self._start_control_server()
 
     self._publish_policy()
+    self._publish_firmware()
     self.storage.prune_stale_nodes()
 
     pub.subscribe(self._on_receive, "meshtastic.receive")
@@ -317,6 +340,92 @@ class MeshtasticCollector:
 
     self.storage.set_meta_values(policy)
     logging.info("Published collector policy: %s", policy)
+
+
+
+
+  def _publish_firmware(self) -> None:
+    """Record the device's firmware version and release channel in meta.
+
+    The version is the device's own answer — DeviceMetadata arrives during the
+    config download the SerialInterface constructor waits out — but the channel
+    is not: firmware announces '2.7.26.54e0d8d' and has no idea whether that
+    build shipped as a Beta or an Alpha. That is a fact about Meshtastic's
+    release listing, not about the radio, so it is looked up there (see
+    FIRMWARE_RELEASES_URL) and archived beside the version for readers to print.
+
+    Republished on every startup for the same reason the policy keys are: these
+    describe the device as it is being read *now*, and a reflash — the whole
+    reason a reader wants this line — only becomes visible if the restart that
+    follows it rewrites the keys. Both are written even when empty, so a value
+    from a previous device or an earlier build cannot outlive whatever reported
+    it.
+
+    Nothing here may stop the collector. A startup that archives packets but
+    cannot name its firmware is degraded; one that dies over a GitHub timeout
+    is broken. The lookup wraps its own failures, and metadata that never
+    arrived reads as '' — old firmware genuinely never sends it.
+    """
+    metadata = getattr(self.interface, "metadata", None)
+    version = getattr(metadata, "firmware_version", "") or ""
+
+    channel = self._lookup_firmware_channel(version) if version else ""
+
+    self.storage.set_meta_values({
+      "firmware_version": version,
+      "firmware_channel": channel,
+    })
+
+    if version:
+      logging.info("Device firmware %s (%s)", version, channel or "channel unknown")
+    else:
+      logging.warning(
+        "Device did not report a firmware version; readers will say unknown"
+      )
+
+
+
+
+  def _lookup_firmware_channel(self, version: str) -> str:
+    """Which channel `version` shipped on: 'beta', 'alpha', or '' for cannot-say.
+
+    Read off the release title — Meshtastic names every release 'Meshtastic
+    Firmware <version> Beta' or '... Alpha' — rather than inferred from GitHub's
+    prerelease flag. The title is the label the project actually stamps on the
+    release; the flag agrees with it today, but if the two ever part, the title
+    is what a person comparing against the releases page will call correct.
+
+    '' on any failure — network down, rate-limited, a build the listing has
+    never heard of (self-compiled, or older than the page reaches back) —
+    because a wrong tag is worse than none: the reader prints the version
+    untagged and is not lying to anyone. And failure is one WARNING line, not a
+    traceback: an unreachable GitHub during startup is weather, not a defect in
+    this process.
+    """
+    try:
+      with urllib.request.urlopen(
+        FIRMWARE_RELEASES_URL, timeout=FIRMWARE_LOOKUP_TIMEOUT
+      ) as response:
+        releases = json.load(response)
+
+      for release in releases:
+        if release.get("tag_name") != f"v{version}":
+          continue
+        words = (release.get("name") or "").split()
+        label = words[-1].lower() if words else ""
+        return label if label in ("alpha", "beta") else ""
+
+      logging.info(
+        "Firmware %s is not in Meshtastic's release listing; "
+        "its channel stays unsaid", version
+      )
+    except Exception as error:
+      logging.warning(
+        "Firmware channel lookup failed (%s); the version will read untagged",
+        error,
+      )
+
+    return ""
 
 
 
