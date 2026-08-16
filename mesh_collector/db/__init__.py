@@ -100,7 +100,11 @@ class Storage:
 
 
   def _read_schema_version(self) -> str:
-    with open(SCHEMA_FILE, "r") as f:
+    # encoding named rather than left to the locale: schema.sql's comments are
+    # full of em dashes, and a service started without LANG set can resolve a
+    # preferred encoding that cannot decode them — which would be a startup
+    # crash on a file this code has to read before it can do anything at all.
+    with open(SCHEMA_FILE, "r", encoding="utf-8") as f:
       first_line = f.readline().strip()
     if first_line.startswith("-- schema_version:"):
       return first_line.split(":", 1)[1].strip()
@@ -277,7 +281,7 @@ class Storage:
     if is_existing_database:
       self._backup_database()
 
-    with open(SCHEMA_FILE, "r") as f:
+    with open(SCHEMA_FILE, "r", encoding="utf-8") as f:
       sql_script = f.read()
 
     with self.conn:
@@ -554,50 +558,69 @@ class Storage:
 
 
 
+  # The two prune methods below take `self._lock` even though their only callers
+  # — insert_message and insert_direct_message — already hold it. The lock is an
+  # RLock precisely so that is free, and taking it here is what makes each of
+  # these correct read on its own terms rather than correct because of a caller
+  # it does not name. `prune_stale_nodes` is public and has always taken it; the
+  # rule is now the same for all three, and a `with self.conn:` transaction can
+  # no longer be opened on this connection by an unlocked path.
+
+
   def _prune_messages(self) -> None:
     """Delete channel messages beyond MAX_MESSAGES limit."""
     max_messages = Config.get("MAX_MESSAGES")
-    # The DELETE below re-sorts the whole table to usually remove nothing;
-    # an index-served COUNT decides first whether there is anything to do.
-    count = self.conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    if count <= max_messages:
-      return
-    with self.conn:
-      deleted = self.conn.execute(
-        """DELETE FROM messages
-           WHERE id NOT IN (
-               SELECT id FROM messages
-               ORDER BY rx_time DESC
-               LIMIT ?
-           )""",
-        (max_messages,),
-      ).rowcount
-      
+
+    with self._lock:
+      # The DELETE below re-sorts the whole table to usually remove nothing;
+      # an index-served COUNT decides first whether there is anything to do.
+      count = self.conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+      if count <= max_messages:
+        return
+
+      with self.conn:
+        deleted = self.conn.execute(
+          """DELETE FROM messages
+             WHERE id NOT IN (
+                 SELECT id FROM messages
+                 ORDER BY rx_time DESC
+                 LIMIT ?
+             )""",
+          (max_messages,),
+        ).rowcount
+
     if deleted:
       noun = "Message" if deleted == 1 else "Messages"
-      logging.info("%d %s pruned", deleted, noun)  
+      logging.info("%d %s pruned", deleted, noun)
+
+
 
 
   def _prune_direct_messages(self) -> None:
     """Delete direct messages beyond MAX_DIRECT_MESSAGES limit."""
     max_dm = Config.get("MAX_DIRECT_MESSAGES")
-    count = self.conn.execute("SELECT COUNT(*) FROM direct_messages").fetchone()[0]
-    if count <= max_dm:
-      return
-    with self.conn:
-      deleted = self.conn.execute(
-        """DELETE FROM direct_messages
-           WHERE id NOT IN (
-               SELECT id FROM direct_messages
-               ORDER BY rx_time DESC
-               LIMIT ?
-           )""",
-        (max_dm,),
-      ).rowcount
-      
+
+    with self._lock:
+      count = self.conn.execute("SELECT COUNT(*) FROM direct_messages").fetchone()[0]
+      if count <= max_dm:
+        return
+
+      with self.conn:
+        deleted = self.conn.execute(
+          """DELETE FROM direct_messages
+             WHERE id NOT IN (
+                 SELECT id FROM direct_messages
+                 ORDER BY rx_time DESC
+                 LIMIT ?
+             )""",
+          (max_dm,),
+        ).rowcount
+
     if deleted:
       noun = "Direct message" if deleted == 1 else "Direct messages"
-      logging.info("%d %s pruned", deleted, noun)      
+      logging.info("%d %s pruned", deleted, noun)
+
+
 
 
   def prune_stale_nodes(self) -> None:

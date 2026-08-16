@@ -12,7 +12,7 @@ import time
 import sqlite3
 import urllib.request
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from meshtastic.mesh_interface import MeshInterface
 from meshtastic.protobuf import mesh_pb2, portnums_pb2, storeforward_pb2, telemetry_pb2
@@ -22,6 +22,15 @@ from pubsub import pub
 from mesh_collector import selflog
 from mesh_collector.config import Config
 from mesh_collector.db import Storage
+
+# The transmit path's types, for reading rather than for running. mesh-link is an
+# optional dependency — an archive-only install has none on its import path, which
+# is the whole point of `uv sync` without `--extra tx` — so it cannot be imported
+# at module scope. `from __future__ import annotations` means every annotation
+# below is a string that is never evaluated, so naming these costs nothing at
+# runtime and the send methods stop being the only unannotated ones in the file.
+if TYPE_CHECKING:
+  from mesh_link import PendingRequest, SendTextRequest
 
 
 LOG_FORMAT = "[%(levelname)s] %(message)s"
@@ -580,7 +589,7 @@ class MeshtasticCollector:
 
 
 
-  def _answer_control_request(self, pending) -> None:
+  def _answer_control_request(self, pending: PendingRequest) -> None:
     """Act on one request and answer it, whatever happens.
 
     BaseException rather than Exception on purpose. meshtastic's _sendPacket
@@ -640,7 +649,9 @@ class MeshtasticCollector:
 
 
 
-  def _handle_send_request(self, pending, request) -> None:
+  def _handle_send_request(
+    self, pending: PendingRequest, request: SendTextRequest
+  ) -> None:
     """Transmit one message and record what was sent.
 
     The archive has to be written here rather than left to the receive path.
@@ -731,7 +742,9 @@ class MeshtasticCollector:
 
 
 
-  def _transmit_reaction(self, request, want_ack: bool):
+  def _transmit_reaction(
+    self, request: SendTextRequest, want_ack: bool
+  ) -> mesh_pb2.MeshPacket:
     """Send a reaction, which `sendText` cannot express.
 
     The flag that makes a reply a reaction is `emoji` on meshtastic's `Data`, and
@@ -778,7 +791,11 @@ class MeshtasticCollector:
 
 
   def _archive_outbound(
-    self, request, message_id: int, is_direct: bool, is_reaction: bool = False
+    self,
+    request: SendTextRequest,
+    message_id: int,
+    is_direct: bool,
+    is_reaction: bool = False,
   ) -> tuple[bool, int]:
     """Write the row for a message this collector just sent.
 
@@ -1439,7 +1456,30 @@ class MeshtasticCollector:
 
     to_id = packet.get("toId")
     message_id = packet.get("id", 0)
-    rx_time = packet.get("rxTime", int(time.time()))
+
+    # **A message with no packet id is not archivable, and archiving it anyway
+    # would cost more than the one message.** `messages.message_id` is UNIQUE, so
+    # a row written under id 0 makes every *later* id-less packet look like a
+    # duplicate of it — silently, since a duplicate is a DEBUG line and not an
+    # error. One lost message becomes all of them. The send path already refuses
+    # to archive a packet the radio gave no id for (see _handle_send_request);
+    # this is the same refusal on the way in, said at WARNING because an inbound
+    # packet with no id is not something this collector caused.
+    if not message_id:
+      logging.warning(
+        "Message from %s carries no packet id; not archiving %r",
+        from_node_id, text[:60],
+      )
+      return
+
+    # `or`, not a `.get` default: rxTime is 0 *or absent* when the device has no
+    # time fix, and `.get("rxTime", ...)` only answers the absent half. A live
+    # packet is still live, so the wall clock is the honest fallback — the same
+    # reasoning, and the same expression, as the `lastHeard` line in
+    # _handle_receive. Written the other way here, a radio with no fix stamped
+    # every message it heard at the epoch and sorted them below the archive
+    # forever.
+    rx_time = packet.get("rxTime") or int(time.time())
     snr = packet.get("rxSnr")
     rssi = packet.get("rxRssi")
     hop_count = _hops_taken(packet)

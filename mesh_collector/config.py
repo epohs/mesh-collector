@@ -95,7 +95,7 @@ class Config:
 
     if CONFIG_FILE_PATH.exists():
       try:
-        with open(CONFIG_FILE_PATH, "r") as f:
+        with open(CONFIG_FILE_PATH, "r", encoding="utf-8") as f:
           file_config = json.load(f)
         for key, value in file_config.items():
           if key not in settings:
