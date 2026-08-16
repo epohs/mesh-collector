@@ -280,7 +280,17 @@ class MeshtasticCollector:
       self.storage.close()
       sys.exit(1)
 
-    self._sync_channels()
+    # **A collector that cannot describe its channels must not archive into
+    # them.** Nothing is in flight yet — the control socket is not listening and
+    # the receive handlers are not subscribed until further down — so exiting
+    # here loses no message and leaves no client waiting. The retry is systemd's,
+    # exactly as it is for the missing device above; _sync_channels has already
+    # said in the journal whether the radio or the database was at fault, because
+    # a unit restarting every five seconds explains nothing on its own.
+    if not self._sync_channels():
+      self.stop()
+      sys.exit(1)
+
     self._initial_node_sync()
     self._warn_if_mqtt_proxy_expected()
 
@@ -1630,10 +1640,23 @@ class MeshtasticCollector:
 
 
 
-  def _sync_channels(self) -> None:
+  def _sync_channels(self) -> bool:
     """
     Sync channels from device into database.
     Channels tracked: PRIMARY_CHANNEL if LOG_PRIMARY_CHANNEL=True, plus any in LOG_CHANNEL_IDS.
+
+    Returns False when a channel was meant to be recorded and none was. start()
+    turns that into a nonzero exit; see the comment there for why that is the
+    right answer rather than carrying on.
+
+    **A tracked channel with no row in `channels` is a channel whose messages
+    disappear.** Every reader joins messages against that table, so the collector
+    goes on archiving into it and nothing can display the result — the archive
+    looks healthy and the channel looks silent. That is the failure this whole
+    method is arranged around, and it is why the counting below exists rather
+    than a single try/except over the lot: the old shape logged one exception and
+    let start() continue, so the collector came up, subscribed, and wrote messages
+    that no reader would ever join.
     """
     primary_channel = Config.get("PRIMARY_CHANNEL", 0)
     logging.info(
@@ -1643,11 +1666,30 @@ class MeshtasticCollector:
       Config.get("LOG_CHANNEL_IDS"),
     )
 
+    tracked = self.tracked_channels
+    logging.info("Config-tracked channel indexes: %s", tracked)
+
+    # A collector configured to log no channels at all is a legal configuration,
+    # not a failed sync. Checked before anything else so that "nothing landed"
+    # below can only ever mean "nothing landed that was supposed to".
+    if not tracked:
+      logging.info("No channels are configured for logging; nothing to sync")
+      return True
+
+    # Reading the device's channel list is all-or-nothing — there is no partial
+    # answer to salvage — so it fails as a unit, separately from the per-channel
+    # writes below, and says so in its own words. The two failures want different
+    # things from whoever reads the journal: this one is the radio, the one after
+    # the loop is the database.
     try:
       local_node = self.interface.getNode("^local")
       if not local_node:
-        logging.warning("No local node available; cannot sync channels")
-        return
+        logging.error(
+          "The device did not return a local node, so no channel could be "
+          "recorded. Exiting so the service manager retries; if this repeats, "
+          "the radio is connected but not answering config requests."
+        )
+        return False
 
       channels = getattr(local_node, "channels", None)
       if channels is None:
@@ -1660,9 +1702,23 @@ class MeshtasticCollector:
         if isinstance(idx, int):
           device_channels[idx] = ch
 
-      logging.info("Config-tracked channel indexes: %s", self.tracked_channels)
+    except Exception:
+      logging.exception(
+        "Could not read the channel list from the device, so no channel could "
+        "be recorded. Exiting so the service manager retries."
+      )
+      return False
 
-      for idx in self.tracked_channels:
+    # The per-channel try covers the name derivation as well as the write. A
+    # channel object the library hands back in an unexpected shape raises in the
+    # getattr walk, not in sqlite, and wrapping only the write would let that one
+    # malformed channel cost every channel after it — the same all-or-nothing
+    # failure, moved down one line.
+    landed = 0
+    failed = 0
+
+    for idx in tracked:
+      try:
         ch = device_channels.get(idx)
 
         name = None
@@ -1681,11 +1737,39 @@ class MeshtasticCollector:
 
         logging.info("Tracking channel: index=%s name=%s", idx, name)
         self.storage.upsert_channel(idx, name)
+        landed += 1
 
+      except Exception:
+        failed += 1
+        logging.exception("Failed to record channel %s", idx)
+
+    # None landing is fatal; some landing is not. Losing one channel of four
+    # should not cost the other three their collector — that channel's messages
+    # are invisible, which the WARNING says, and the archive is still doing most
+    # of its job. Losing all of them means the collector would come up and write
+    # nothing anybody can read, which is worth a restart.
+    if not landed:
+      logging.error(
+        "The device answered, but none of the %d tracked channels could be "
+        "written to the archive. Messages would be stored into channels no "
+        "reader can join against, so exiting instead; the service manager will "
+        "retry. The database is the thing to look at, not the radio.",
+        failed,
+      )
+      return False
+
+    if failed:
+      logging.warning(
+        "%d of %d tracked channels could not be recorded. Messages on those "
+        "channels will be archived but will not appear in any reader until "
+        "their rows exist.",
+        failed,
+        landed + failed,
+      )
+    else:
       logging.info("Channels synced successfully")
 
-    except Exception:
-      logging.exception("Failed to sync channels")
+    return True
 
 
 

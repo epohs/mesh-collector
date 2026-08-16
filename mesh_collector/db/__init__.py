@@ -368,18 +368,26 @@ class Storage:
 
 
   def upsert_channel(self, channel_index: int, name: str) -> None:
-    """Insert or update a channel."""
-    try:
-      with self._lock, self.conn:
-        self.conn.execute(
-          """INSERT INTO channels (channel_index, name)
-             VALUES (?, ?)
-             ON CONFLICT(channel_index) DO UPDATE SET
-             name = excluded.name""",
-          (channel_index, name)
-        )
-    except Exception:
-      logging.exception("Failed to upsert channel")
+    """Insert or update a channel.
+
+    Raises on failure, like every other write in this class. It used to catch and
+    log its own exceptions, which meant a channel that never got a row was
+    indistinguishable at the call site from one that did: the sync counted it as
+    done, logged "Channels synced successfully" over the top of the ERROR, and the
+    collector went on to archive messages into a channel with no row — which every
+    reader joins against, so those messages are in the archive and appear nowhere.
+
+    Deciding how bad a failed channel write is belongs to the caller, because the
+    caller is the only thing here that knows whether the rest of them landed.
+    """
+    with self._lock, self.conn:
+      self.conn.execute(
+        """INSERT INTO channels (channel_index, name)
+           VALUES (?, ?)
+           ON CONFLICT(channel_index) DO UPDATE SET
+           name = excluded.name""",
+        (channel_index, name)
+      )
 
 
 
