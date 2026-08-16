@@ -323,12 +323,17 @@ def _describe_payload(portnum: str, payload: bytes) -> Optional[str]:
 # it. `payload` is absent because it needs the portnum from the same line and is
 # handled by `_annotate_payload`; everything else here is context-free.
 #
-# **This table is the coverage check.** verify_mesh_collector.py walks a corpus of
-# real records and asserts no escaped field is missing from it, so a field added
-# by a firmware or library update fails a check instead of quietly arriving as a
-# hundred characters of octal that everyone learns to skip over. That is how the
-# ones below were found: `payload` was decoded, `payload` was the only thing
-# anybody had looked at, and 171 escaped strings in one session were not payloads.
+# **Nothing checks this table for completeness, and this comment used to say
+# something did.** A one-off script walked a corpus of real records and asserted no
+# escaped field was missing from it — that is how the ones below were found:
+# `payload` was decoded, `payload` was the only thing anybody had looked at, and 171
+# escaped strings in one session were not payloads. That script is in no repo, on no
+# machine anyone can find, and in no git history, and nothing has replaced it.
+# `test_logfmt.py` covers what the entries below *do*, which is a different claim
+# and a weaker one: it cannot notice a field the table has never heard of. So a
+# field added by a firmware or library update arrives as a hundred characters of
+# octal that everyone learns to skip over — and if it is a secret, it arrives in
+# full. Adding an entry here is still a manual job done by reading a DEBUG session.
 #
 # **Two of them are secrets and are removed rather than rendered.** A collector
 # at DEBUG logs its own `config { security { private_key } }` once at the

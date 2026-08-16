@@ -70,6 +70,11 @@ contains the private key of the radio and the keys to its channels.** Treat one
 as a secret: do not paste it into an issue, and do not keep it where the archive
 is served from.
 
-`python3 verification/verify_mesh_collector.py --audit /path/to/log` reads a
-captured log and reports any encoded field that arrived without being decoded or
-redacted. Worth running against a session after a firmware or library update.
+**Nothing here audits a captured log for fields that arrived neither decoded nor
+redacted.** A one-off script did once and is not in this repo; there is no
+`verification/` directory, and this paragraph told you to run one for longer than
+it should have. What decides whether a field is redacted is `_BYTE_FIELDS` in
+`mesh_collector/logfmt.py`, and that table's comment is where the guarantee — and
+what is not guaranteed — is written down. A session captured after a firmware or
+library update is still the one worth reading, because that is when a field the
+table has never heard of shows up.
