@@ -20,18 +20,28 @@ SCHEMA_FILE = Path(__file__).parent / "schema.sql"
 # In-place upgrades, keyed by the version an archive is *at*: each rung names the
 # version it arrives at and the statements that get it there.
 #
-# Only MINOR bumps belong here, and only the additive kind schema.sql already
-# promises readers — ALTER TABLE ADD COLUMN, or nothing at all. That restriction
-# is what makes a rung safe to apply without understanding the rows: adding a
-# column cannot lose data, cannot reinterpret a value, and leaves every existing
-# reader correct. Anything that rewrites or drops is a MAJOR bump and takes the
-# rebuild path, where the operator has to authorize the loss explicitly.
+# Only MINOR and PATCH bumps belong here, and only the additive kind schema.sql
+# already promises readers — ALTER TABLE ADD COLUMN, or nothing at all. That
+# restriction is what makes a rung safe to apply without understanding the rows:
+# adding a column cannot lose data, cannot reinterpret a value, and leaves every
+# existing reader correct. Anything that rewrites or drops is a MAJOR bump and
+# takes the rebuild path, where the operator has to authorize the loss
+# explicitly.
 #
 # "Nothing at all" is a real rung, not a degenerate one: a MINOR bump that only
 # adds meta keys has no DDL to run, because meta rows are written by the running
 # collector rather than by this ladder. The rung still exists so the stamp moves
 # — an archive left reading 0.10.0 while carrying 0.11.0's keys would be lying
 # to readers about what they may find in it.
+#
+# A PATCH rung is empty for a stronger reason: there is nothing it *could* run.
+# 0.12.1 corrects two column defaults, and SQLite keeps a default in the table's
+# own DDL, reachable only by rewriting the table — which is the MAJOR-shaped
+# work this ladder refuses by construction. So an existing archive keeps the old
+# defaults until something rebuilds it, and only a rebuilt one is spelled the
+# corrected way. That is sufficient rather than a compromise: the defaults being
+# corrected were never reached, because upsert_node names every column it
+# writes. The bump is for the next person reading schema.sql, not for the rows.
 #
 # A ladder rather than a map so multiple versions can be crossed in one startup:
 # a 0.9.0 archive meeting a future 0.11.0 walks 0.9.0 -> 0.10.0 -> 0.11.0. A
@@ -51,6 +61,9 @@ _UPGRADES: dict[str, tuple[str, list[str]]] = {
   # 0.12.0 is one meta key (tidy_log_local_node), written by the running
   # collector as it groups the tidy log's Self entries — see selflog.py.
   "0.11.0": ("0.12.0", []),
+  # 0.12.1 drops DEFAULT 0 from nodes.via_mqtt and nodes.has_public_key. No DDL
+  # for the same reason as above, and none is owed — see the PATCH paragraph.
+  "0.12.0": ("0.12.1", []),
 }
 
 

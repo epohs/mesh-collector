@@ -1,4 +1,4 @@
--- schema_version: 0.12.0
+-- schema_version: 0.12.1
 
 -- -------------------
 -- What the version number promises
@@ -58,6 +58,19 @@
 -- collector reads it back — and it is documented below anyway, because a key a
 -- reader can SELECT is a key this file owes an account of, if only to say
 -- "not yours". Neither reader moves its floor; neither should ever select it.
+--
+-- 0.12.1 is the first PATCH, and it is the one thing the PATCH line above names
+-- outright: a corrected default. nodes.via_mqtt and nodes.has_public_key are
+-- documented below as tri-state and were declared DEFAULT 0 anyway. No reader
+-- has ever been able to tell, because upsert_node names both columns on every
+-- insert and so never reaches the default. What the two lines were was a trap
+-- for whoever added the next column by copying them: the rungs in _UPGRADES are
+-- ALTER TABLE ADD COLUMN, and an added column carrying DEFAULT 0 backfills the
+-- whole table with an assertion nobody established. The rung for this bump is
+-- empty, and has to be — SQLite keeps a column's default in the table's own
+-- DDL, so an archive that already exists keeps the old one until it is rebuilt,
+-- and rewriting a live table to correct an unreachable default would be a MAJOR
+-- bump taking the destructive path over nothing.
 --
 -- The collector itself is stricter, and has to be, but it is no longer strict to
 -- the point of destroying the archive over an added column. It carries an
@@ -214,8 +227,15 @@ CREATE TABLE IF NOT EXISTS nodes (
     -- indexes a `SELECT *` row positionally can, and additive has to mean
     -- additive for both kinds.
     hops_away INTEGER,
-    via_mqtt INTEGER DEFAULT 0,
-    has_public_key INTEGER DEFAULT 0,
+    -- No DEFAULT, on these two or on hops_away above: all three are tri-state,
+    -- and NULL is how this schema says "never established" rather than 0. The
+    -- two below carried DEFAULT 0 until 0.12.1 — unreachable, because
+    -- upsert_node names every column it writes, but the _UPGRADES rungs are
+    -- ALTER TABLE ADD COLUMN and an added column with a DEFAULT backfills every
+    -- existing row with it. Why that is a lie rather than a tidy-up is written
+    -- out on messages.emoji below; a column copied from here inherits this.
+    via_mqtt INTEGER,
+    has_public_key INTEGER,
     lux REAL,
     iaq INTEGER,
     gas_resistance REAL
