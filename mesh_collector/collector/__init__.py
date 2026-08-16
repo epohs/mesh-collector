@@ -9,7 +9,6 @@ import re
 import signal
 import sys
 import time
-import sqlite3
 import urllib.request
 
 from typing import TYPE_CHECKING, Optional
@@ -976,13 +975,10 @@ class MeshtasticCollector:
 
     portnum = decoded.get("portnum")
 
-    try:
-      existing = self.storage.get_node(from_node_id)
-    except sqlite3.ProgrammingError as e:
-      # The connection is closing under us mid-shutdown. Drop the packet; do
-      # not re-raise into the reader thread.
-      logging.debug("Database unavailable during packet processing: %s", e)
-      return
+    # A read racing shutdown answers None rather than raising — Storage owns
+    # that now, see get_meta's comment — and the `if not existing` branch below
+    # already knows what to do with None.
+    existing = self.storage.get_node(from_node_id)
 
     if not existing and portnum != "NODEINFO_APP":
       # The device's node cache may hold this node's identity from a NODEINFO

@@ -311,6 +311,18 @@ class Storage:
 
   def get_meta(self, key: str) -> Optional[str]:
     with self._lock:
+      # A read that arrives after close() gets the same answer as a read that
+      # found nothing: None. Shutdown is not an error, and a packet still in
+      # flight when the archive closes should not raise into the reader thread
+      # and log a traceback on the way out.
+      #
+      # Reads only, and the asymmetry is deliberate — do not "finish the job"
+      # by adding this to the writers. A write returning quietly after close
+      # would swallow a message we were told to keep; letting it raise is the
+      # honest outcome. The check lives inside the lock so it cannot race a
+      # concurrent close().
+      if self.conn is None:
+        return None
       row = self.conn.execute(
         "SELECT value FROM meta WHERE key = ?", (key,)
       ).fetchone()
@@ -459,6 +471,12 @@ class Storage:
   def get_node(self, node_id: str) -> Optional[dict]:
     """Retrieve a node by its node_id."""
     with self._lock:
+      # Closed archive reads as "no such node" — see get_meta for why the reads
+      # answer None and the writes are left to raise. This is the one the
+      # receive path calls, so it is the one that decides whether a packet
+      # arriving during shutdown produces a traceback.
+      if self.conn is None:
+        return None
       row = self.conn.execute(
         "SELECT * FROM nodes WHERE node_id = ?", (node_id,)
       ).fetchone()
