@@ -988,6 +988,12 @@ class MeshtasticCollector:
     # A read racing shutdown answers None rather than raising — Storage owns
     # that now, see get_meta's comment — and the `if not existing` branch below
     # already knows what to do with None.
+    #
+    # This row is read once and used twice: here, to decide whether to seed, and
+    # again at the bottom of this function where it is handed to
+    # _on_node_update. It used to be read twice per decoded packet, which is the
+    # hottest path in the process. The rules for passing it on are on
+    # _apply_node_update, and the seed call below is the reason they matter.
     existing = self.storage.get_node(from_node_id)
 
     if not existing and portnum != "NODEINFO_APP":
@@ -1091,7 +1097,11 @@ class MeshtasticCollector:
         "publicKey": user.get("publicKey"),
       }
 
-    self._on_node_update(normalized)
+    # The row read at the top, handed on rather than read again. Stale by one
+    # seed in exactly one case, which _apply_node_update's guard catches — the
+    # note there is the whole argument and should be read before changing either
+    # end of this.
+    self._on_node_update(normalized, existing=existing)
 
 
 
@@ -1216,7 +1226,12 @@ class MeshtasticCollector:
 
 
 
-  def _on_node_update(self, node_data: dict, quiet: bool = False) -> bool:
+  def _on_node_update(
+    self,
+    node_data: dict,
+    quiet: bool = False,
+    existing: Optional[dict] = None,
+  ) -> bool:
     """
     Update node record in database. Returns True when a row was inserted.
     Accepts full NODEINFO or partial updates (POSITION_APP, TELEMETRY_APP).
@@ -1226,12 +1241,20 @@ class MeshtasticCollector:
     from_initial_sync and meant both "be quiet" and "this is the replay",
     which is why the seed path — a live discovery — logged nothing.
 
+    `existing` is an optional row the caller has already read, passed through
+    to _apply_node_update, which owns the rules for when it may be believed.
+    Only the receive path supplies one; the other three callers have no prior
+    read and pass nothing, which is the behaviour this function has always had.
+    It crosses the try below harmlessly, but note that the read itself must
+    stay outside — this is the boundary the library thread may not escape, and
+    a read moved above it would be a read outside the guard.
+
     Reached from _on_node_updated (the meshtastic.node.updated listener), so
     the same rule as _on_receive applies: this runs on a library thread and
     nothing may escape it.
     """
     try:
-      return self._apply_node_update(node_data, quiet)
+      return self._apply_node_update(node_data, quiet, existing)
     except Exception:
       logging.exception("Error updating node record")
       return False
@@ -1239,7 +1262,12 @@ class MeshtasticCollector:
 
 
 
-  def _apply_node_update(self, node_data: dict, quiet: bool) -> bool:
+  def _apply_node_update(
+    self,
+    node_data: dict,
+    quiet: bool,
+    existing: Optional[dict] = None,
+  ) -> bool:
     user_data = node_data.get("user") or {}
     raw_num = node_data.get("num")
     node_id = str(
@@ -1273,7 +1301,29 @@ class MeshtasticCollector:
         if k not in ("longName", "shortName", "hwModel")
       }
 
-    existing = self.storage.get_node(node_id) or {}
+    # The caller may already hold this row. Only the receive path does, and only
+    # because it had to read the node before deciding whether to seed one — that
+    # SELECT bought the decision and then bought nothing, because this line read
+    # the same row again, once per decoded packet, on the hottest path here.
+    #
+    # Believed only when it is a row *for this node*. The receive path keys its
+    # read on the packet header's sender; node_id above is derived from user.id,
+    # which a NODEINFO may legitimately spell differently. So identity is checked
+    # rather than assumed, and a mismatch just reads again.
+    #
+    # **Identity is not freshness, and there is a writer between the two points.**
+    # _handle_receive calls _seed_node_from_interface after its read, which
+    # reaches this function and writes this very row. That is safe for one
+    # reason, worth stating so it is not rediscovered by someone widening this
+    # test: the seed call sits inside `if not existing`, so it can only run when
+    # the caller's row was falsy — and a falsy row fails the test below and is
+    # re-read. A seeded identity can therefore never be merged against the None
+    # that preceded it. Nothing else writes `nodes` in that window: upsert_node
+    # has exactly one call site, this function, and every path to it runs on the
+    # library's reader thread, which is the thread already inside this call.
+    if existing is None or existing.get("node_id") != node_id:
+      existing = self.storage.get_node(node_id) or {}
+
     is_new_node = not existing
 
     device_metrics = node_data.get("deviceMetrics", {})
