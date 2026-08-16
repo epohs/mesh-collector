@@ -48,6 +48,9 @@ _UPGRADES: dict[str, tuple[str, list[str]]] = {
   # 0.11.0 is meta keys only (firmware_version, firmware_channel), which the
   # collector publishes itself at startup — see _publish_firmware.
   "0.10.0": ("0.11.0", []),
+  # 0.12.0 is one meta key (tidy_log_local_node), written by the running
+  # collector as it groups the tidy log's Self entries — see selflog.py.
+  "0.11.0": ("0.12.0", []),
 }
 
 
@@ -330,6 +333,20 @@ class Storage:
         "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
         sorted(values.items()),
       )
+
+
+
+
+  def delete_meta(self, key: str) -> None:
+    """Remove a meta key outright.
+
+    For state whose absence means something — the tidy log's held Self record is
+    deleted on a device swap, because an empty-but-present row would still name
+    which key last held the old device's readings. Deleting a key that is not
+    there is a no-op, which is what lets the swap path call this unconditionally.
+    """
+    with self._lock, self.conn:
+      self.conn.execute("DELETE FROM meta WHERE key = ?", (key,))
 
 
 

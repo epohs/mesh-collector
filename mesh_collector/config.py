@@ -33,6 +33,7 @@ COLLECTOR_CONFIG = {
   "LOG_CHANNEL_IDS": [],              # Additional channel indexes to track
   "ALLOW_DESTRUCTIVE_REBUILD": False, # Permit wiping the database when schema.sql version changes
   "TIDY_LOGS": True,                  # Format mesh traffic and collapse library chatter; off logs raw
+  "TIDY_LOG_LOCAL_NODE_PERIOD": 15,   # Minutes between the tidy log's Self entries; 0 logs every update
 }
 
 # Transmitting. Its own group because it is the one thing in this project that

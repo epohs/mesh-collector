@@ -1,4 +1,4 @@
--- schema_version: 0.11.0
+-- schema_version: 0.12.0
 
 -- -------------------
 -- What the version number promises
@@ -52,6 +52,13 @@
 -- itself is the upgrade — and neither reader moves its floor, because both
 -- treat an absent key as "the collector never said" rather than as an error.
 --
+-- 0.12.0 is again one meta key and one empty rung: tidy_log_local_node, the
+-- held state behind the tidy log's Self entry (see selflog.py). It is
+-- the first key that is not for readers at all — the collector writes it and the
+-- collector reads it back — and it is documented below anyway, because a key a
+-- reader can SELECT is a key this file owes an account of, if only to say
+-- "not yours". Neither reader moves its floor; neither should ever select it.
+--
 -- The collector itself is stricter, and has to be, but it is no longer strict to
 -- the point of destroying the archive over an added column. It carries an
 -- upgrade ladder for MINOR bumps: a database whose version has a rung in
@@ -100,6 +107,14 @@
 --                          build, an archive from before this key), and a
 --                          reader shows the version untagged rather than
 --                          guessing.
+--   tidy_log_local_node    JSON. The collector's own working state for the tidy
+--                          log's Self entry: which node it describes, when the
+--                          last Self line was written, and the field changes
+--                          held since ({"node_id", "logged_at", "changes"}).
+--                          Writer-private — the collector is its only reader,
+--                          it is deleted on a device swap, and its shape may
+--                          change without a version bump, because no reader is
+--                          entitled to it. See selflog.py.
 --
 -- The collector republishes the policy keys on every startup, so they describe
 -- the archive as it is being written now. They are facts for readers to consult

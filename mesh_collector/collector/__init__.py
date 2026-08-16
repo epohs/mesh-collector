@@ -19,6 +19,7 @@ from meshtastic.protobuf import mesh_pb2, portnums_pb2, storeforward_pb2, teleme
 from meshtastic.serial_interface import SerialInterface
 from pubsub import pub
 
+from mesh_collector import selflog
 from mesh_collector.config import Config
 from mesh_collector.db import Storage
 
@@ -288,6 +289,13 @@ class MeshtasticCollector:
         stored_node_id,
         self.local_node_id,
       )
+      # The tidy log's held Self state describes the device that was unplugged.
+      # `selflog.record` would discard it anyway on the node_id mismatch, but a
+      # swap is the one moment the archive is known to be changing identity, so
+      # the state is removed here, explicitly, rather than left for a guard to
+      # catch — a Self line must never carry the old node's readings under the
+      # new node's id.
+      selflog.reset(self.storage)
       self.storage.set_meta("local_node_id", self.local_node_id)
       self._restart_process()
 
@@ -1337,7 +1345,30 @@ class MeshtasticCollector:
         changed[key] = new
 
     if changed:
-      logging.info("Node %s updated: %s", node_id, _format_changes(changed))
+      if node_id == self.local_node_id and _tidy_logs():
+        # The attached device reporting on itself, which it does every minute or
+        # two — frequent enough that these lines were most of a quiet mesh's
+        # INFO volume. In tidy logs they are grouped into one Self line per
+        # TIDY_LOG_LOCAL_NODE_PERIOD (see selflog.py); the node row above was
+        # already written, so only the log is thinned. `Self` rather than `Node`
+        # because the viewer colours that word to say "this is the radio the
+        # frame belongs to" — and because a reader grepping for the device's id
+        # still finds it, on fewer lines.
+        flushed = selflog.record(
+          self.storage,
+          node_id,
+          changed,
+          period_seconds=max(0, int(Config.get("TIDY_LOG_LOCAL_NODE_PERIOD", 15))) * 60,
+          now=time.time(),
+        )
+        if flushed is not None:
+          logging.info("Self %s updated: %s", node_id, _format_changes(flushed))
+        else:
+          # DEBUG keeps the held updates visible to anyone watching at that
+          # level, the way "Skip: (no changes)" already is.
+          logging.debug("Self %s held for the tidy log: %s", node_id, _format_changes(changed))
+      else:
+        logging.info("Node %s updated: %s", node_id, _format_changes(changed))
     else:
       logging.debug("Skip: %s (no changes)", node_id)
 

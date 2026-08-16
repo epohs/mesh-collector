@@ -9,6 +9,7 @@
     "SERIAL_PORT": "/dev/ttyACM0",
     "ALLOW_DESTRUCTIVE_REBUILD": false,
     "TIDY_LOGS": true,
+    "TIDY_LOG_LOCAL_NODE_PERIOD": 15,
 
     "STORE_DIRECT_MESSAGES": false,
     "LOG_PRIMARY_CHANNEL": true,
