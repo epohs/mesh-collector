@@ -94,6 +94,38 @@ def _when_transmit_deploy(_a: dict, selections: set, deploying: bool) -> bool:
   return "mesh-link" in selections and deploying
 
 
+# The transport questions. connection_mode is asked before all three, so by the
+# time these run the answer is in hand; a run where it somehow is not falls back
+# to serial, which is the collector's own default.
+def _mode(answers: dict) -> str:
+  return str(answers.get("connection_mode", "serial")).strip().lower()
+
+
+def _when_serial(answers: dict, _s: set, _d: bool) -> bool:
+  return _mode(answers) == "serial"
+
+
+def _when_tcp(answers: dict, _s: set, _d: bool) -> bool:
+  return _mode(answers) == "tcp"
+
+
+def _when_ble(answers: dict, _s: set, _d: bool) -> bool:
+  return _mode(answers) == "ble"
+
+
+CONNECTION_MODES = ("serial", "tcp", "ble")
+
+
+def _cast_mode(val: str) -> str:
+  return val.strip().lower()
+
+
+def _validate_mode(val: Any) -> str | None:
+  if val not in CONNECTION_MODES:
+    return f"must be one of {', '.join(CONNECTION_MODES)}"
+  return None
+
+
 def _cast_int(val: str) -> int:
   return int(val.strip())
 
@@ -149,12 +181,42 @@ QUESTIONS: list[Question] = [
   # in the Layout phase, not via the QUESTIONS table.
 
   # --- Collector ---
+  # How the collector reaches the node. Asked first because the three questions
+  # below it are each asked only for their own mode.
+  ("connection_mode",
+     "How does the collector reach the node? serial / tcp / ble",
+     "serial",
+     _cast_mode,
+     _validate_mode,
+     _always),
+
   ("serial_port",
      "Serial port for the Meshtastic device",
      "/dev/ttyACM0",
      None,
      _validate_not_empty,
-     _always),
+     _when_serial),
+
+  ("tcp_host",
+     "Hostname or IP of the meshtasticd daemon",
+     "localhost",
+     None,
+     _validate_not_empty,
+     _when_tcp),
+
+  ("tcp_port",
+     "Port for the meshtasticd daemon",
+     4403,
+     _cast_int,
+     _validate_int_range(1, 65535),
+     _when_tcp),
+
+  ("ble_address",
+     "BLE address or advertised name (meshtastic --ble-scan lists them)",
+     "",
+     None,
+     _validate_not_empty,
+     _when_ble),
 
   ("db_path",
      "Archive location (relative to collector checkout)",
@@ -280,7 +342,21 @@ def collector_config(answers: dict) -> dict:
   # DB_PATH is always written, absolute
   result["DB_PATH"] = _absolute_db_path(answers)
 
-  result["SERIAL_PORT"] = answers["serial_port"]
+  # Only the active mode's settings are written. Carrying the other two modes'
+  # keys would put a TCP_HOST nobody chose into a serial install's config.json,
+  # where the next reader of that file has to work out whether it means anything.
+  mode = _mode(answers)
+  result["CONNECTION_MODE"] = mode
+
+  if mode == "tcp":
+    result["TCP_HOST"] = answers.get("tcp_host", "localhost")
+    result["TCP_PORT"] = answers.get("tcp_port", 4403)
+  elif mode == "ble":
+    # Written even though it has no usable default: ble mode without it does not
+    # start, so omitting it would produce a config.json that cannot run.
+    result["BLE_ADDRESS"] = answers.get("ble_address", "")
+  else:
+    result["SERIAL_PORT"] = answers["serial_port"]
 
   if answers.get("primary_channel") != 0:
     result["PRIMARY_CHANNEL"] = answers["primary_channel"]
@@ -310,7 +386,10 @@ def collector_config(answers: dict) -> dict:
 
 
 _COLLECTOR_DEFAULTS = {
+  "CONNECTION_MODE": "serial",
   "SERIAL_PORT": "/dev/ttyACM0",
+  "TCP_HOST": "localhost",
+  "TCP_PORT": 4403,
   "PRIMARY_CHANNEL": 0,
   "LOG_CHANNEL_IDS": [],
   "STORE_DIRECT_MESSAGES": False,
@@ -725,16 +804,48 @@ def render_guide_readme(answers: dict, install_paths: dict | None = None) -> str
 
   # Order of operations
   lines.append("## Order of operations\n")
-  lines.append("1. **Serial-permission check** \u2014 the unit\u2019s user must be "
-                 "able to open the serial port. Run:")
-  lines.append("")
-  lines.append("       id -nG <user>")
-  lines.append("")
-  lines.append("   The output must list `dialout`. If it does not:")
-  lines.append("")
-  lines.append("       sudo usermod -aG dialout <user>")
-  lines.append("")
-  lines.append("   Then log out and back in.\n")
+
+  # Step one is a permission check, and which permission depends on how the
+  # collector reaches the node. `dialout` is about the serial device file and
+  # means nothing to a TCP or BLE install; sending somebody to add themselves to
+  # a group their transport never touches is worse than saying nothing.
+  mode = _mode(answers)
+
+  if mode == "tcp":
+    lines.append("1. **Daemon check** \u2014 this collector connects to "
+                   "`meshtasticd` over TCP, so no device permissions are needed. "
+                   "Confirm the daemon is up and listening:")
+    lines.append("")
+    lines.append("       systemctl status meshtasticd")
+    lines.append("")
+    lines.append("   The collector unit should also declare "
+                   "`After=meshtasticd.service`, so a reboot does not start it "
+                   "against a daemon that has not bound its port yet.\n")
+  elif mode == "ble":
+    lines.append("1. **Bluetooth-permission check** \u2014 the unit\u2019s user "
+                   "must be able to reach the Bluetooth stack over DBus. Run:")
+    lines.append("")
+    lines.append("       id -nG <user>")
+    lines.append("")
+    lines.append("   The output must list `bluetooth`. If it does not:")
+    lines.append("")
+    lines.append("       sudo usermod -aG bluetooth <user>")
+    lines.append("")
+    lines.append("   Then log out and back in. Pair the node before the first "
+                   "run \u2014 the collector cannot answer a PIN prompt, and an "
+                   "unpaired node fails with the library\u2019s own \u201care you "
+                   "in the bluetooth group / did you enter the PIN\u201d error.\n")
+  else:
+    lines.append("1. **Serial-permission check** \u2014 the unit\u2019s user must be "
+                   "able to open the serial port. Run:")
+    lines.append("")
+    lines.append("       id -nG <user>")
+    lines.append("")
+    lines.append("   The output must list `dialout`. If it does not:")
+    lines.append("")
+    lines.append("       sudo usermod -aG dialout <user>")
+    lines.append("")
+    lines.append("   Then log out and back in.\n")
 
   lines.append("2. **Install the units**:")
   lines.append("")
@@ -956,7 +1067,11 @@ def _prompt_with_default(prompt: str, default: Any) -> str:
 
 
 _JSON_TO_ANSWER_KEY: dict[str, str] = {
+  "CONNECTION_MODE": "connection_mode",
   "SERIAL_PORT": "serial_port",
+  "TCP_HOST": "tcp_host",
+  "TCP_PORT": "tcp_port",
+  "BLE_ADDRESS": "ble_address",
   "PRIMARY_CHANNEL": "primary_channel",
   "LOG_CHANNEL_IDS": "additional_channels",
   "STORE_DIRECT_MESSAGES": "archive_dms",
@@ -1098,13 +1213,7 @@ def _run_interview(answers: dict, selections: set[str],
 
     # Special question handlers
     if key == "serial_port":
-      port = _ask_serial_port(answers, selections, deploying)
-      answers["serial_port"] = port
-      if collector_checkout and layout.get("collector"):
-        probe_raw = _prompt_with_default(
-          "Run serial probe? Opens device, reads node info, closes. (y/n)", "n")
-        if probe_raw.lower() in ("y", "yes", "true", "1"):
-          _run_probe(str(layout["collector"]), port)
+      answers["serial_port"] = _ask_serial_port(answers, selections, deploying)
       continue
 
     if key == "retention":
@@ -1156,12 +1265,45 @@ def _run_interview(answers: dict, selections: set[str],
       answers[key] = val
       break
 
+  # After the whole table rather than inside the serial question, because the
+  # probe now depends on answers the transport questions collect — and because
+  # asking "shall I open the link?" reads better once the operator has finished
+  # describing it.
+  if collector_checkout and layout.get("collector"):
+    _maybe_probe(answers, str(layout["collector"]))
+
   # Compute DB_PATH for all three projects
   collector_path = layout.get("collector")
   if collector_path:
     answers["_collector_path"] = str(collector_path)
 
   return answers
+
+
+def _maybe_probe(answers: dict, collector_path: str) -> None:
+  """Offer the opt-in probe for whichever transport was configured.
+
+  BLE is offered but explains itself instead of running: a scan needs the host
+  paired with the node already, and a subprocess that blocks on a pairing prompt
+  nobody can see is a worse answer than a sentence saying so.
+  """
+  mode = _mode(answers)
+
+  if mode == "ble":
+    print(" Probe: skipped for BLE. Pair the host with the node first, then check"
+          " it with `meshtastic --ble-scan` and `meshtastic --ble <addr> --info`.")
+    return
+
+  if mode == "tcp":
+    target = f"{answers.get('tcp_host', 'localhost')}:{answers.get('tcp_port', 4403)}"
+    description = f"Connects to {target}, reads node info, closes."
+  else:
+    target = answers.get("serial_port", "/dev/ttyACM0")
+    description = "Opens device, reads node info, closes."
+
+  raw = _prompt_with_default(f"Run {mode} probe? {description} (y/n)", "n")
+  if raw.lower() in ("y", "yes", "true", "1"):
+    _run_probe(collector_path, mode, answers)
 
 
 def _guess_primary_group() -> str:
@@ -1494,39 +1636,76 @@ def main() -> None:
     print(f"  python3 scripts/mesh_setup.py")
 
 
-def _run_probe(collector_path: str, port: str) -> None:
+def _run_probe(collector_path: str, mode: str, answers: dict) -> None:
   """Run opt-in probe through collector's venv.
 
-  Opens the device, reads node info, closes. Sends nothing over LoRa.
+  Opens the link, reads node info, closes. Sends nothing over LoRa. Only serial
+  and tcp arrive here; BLE is declined by the caller, with a reason.
+
+  The TCP probe checks the socket with `create_connection` before handing the
+  address to TCPInterface, for the reason the collector's TCP_CONNECT_TIMEOUT
+  comment gives: the library's own connect is unbounded, and a probe that hangs
+  for seventy-five seconds inside a setup interview is indistinguishable from a
+  setup script that has crashed.
   """
   venv_python = Path(collector_path) / ".venv" / "bin" / "python3"
   if not venv_python.exists():
     print("  Probe: no venv at", collector_path, "/.venv, skipping")
     return
 
-  code = textwrap.dedent(f"""\
-    import sys
-    try:
-        from meshtastic.serial_interface import SerialInterface
-        iface = SerialInterface(devPath={port!r})
+  if mode == "tcp":
+    host = answers.get("tcp_host", "localhost")
+    port_number = answers.get("tcp_port", 4403)
+    # The bounded socket check comes first, so an absent daemon fails in five
+    # seconds instead of the OS connect timeout.
+    construct = (
+      f"import socket\n"
+      f"socket.create_connection(({host!r}, {port_number!r}), timeout=5).close()\n"
+      f"from meshtastic.tcp_interface import TCPInterface\n"
+      f"iface = TCPInterface(hostname={host!r}, portNumber={port_number!r})\n"
+    )
+    unavailable = (
+      f"FAIL Nothing answered at {host}:{port_number} — "
+      "check meshtasticd is running (systemctl status meshtasticd)"
+    )
+  else:
+    port = answers.get("serial_port", "/dev/ttyACM0")
+    construct = (
+      f"from meshtastic.serial_interface import SerialInterface\n"
+      f"iface = SerialInterface(devPath={port!r})\n"
+    )
+    unavailable = (
+      f"FAIL Port {port!r} not available — "
+      "a running collector may own it (check systemctl status mesh-collector)"
+    )
+
+  # The construction lines and the failure message are the only things that vary
+  # by mode, and both are injected as already-quoted literals rather than
+  # interpolated into the f-strings below — which is why this is concatenation
+  # and not one big template.
+  code = (
+    "import sys\n"
+    "try:\n"
+    + textwrap.indent(construct, "    ")
+    + textwrap.dedent("""\
         long_name = iface.getLongName() or "unknown"
         short_name = iface.getShortName() or "unknown"
-        my_info = iface.getMyNodeInfo() or {{}}
+        my_info = iface.getMyNodeInfo() or {}
         fw = my_info.get("firmwareVersion", "unknown")
         iface.close()
-        print(f"OK  Node: {{long_name}} ({{short_name}}), firmware {{fw}}")
+        print(f"OK  Node: {long_name} ({short_name}), firmware {fw}")
     except Exception as e:
         msg = str(e)
-        if "could not open port" in msg.lower():
-            print(f"FAIL Port {{port!r}} not available \\u2014 "
-                  "a running collector may own it (check systemctl status mesh-collector)")
+        if isinstance(e, OSError) or "could not open port" in msg.lower():
+            print(UNAVAILABLE)
         elif "No module named" in msg:
-            print(f"FAIL Probe needs meshtastic (from uv sync --extra tx), but it is not installed.")
+            print("FAIL Probe needs meshtastic (from uv sync --extra tx), but it is not installed.")
         else:
-            print(f"FAIL {{msg}}")
-    """)
+            print(f"FAIL {msg}")
+    """).replace("UNAVAILABLE", repr(unavailable))
+  )
 
-  print("  Running serial probe...")
+  print(f"  Running {mode} probe...")
   result = subprocess.run(
     [str(venv_python), "-c", code],
     capture_output=True, text=True, timeout=30,

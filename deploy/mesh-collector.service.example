@@ -8,12 +8,27 @@ Type=simple
 #
 # This service runs the mesh-collector Meshtastic collector as a long-lived process.
 #
-# The collector connects to a Meshtastic device via a local serial interface,
+# The collector connects to a Meshtastic node — via a local serial interface, via
+# TCP to a meshtasticd daemon, or via BLE, whichever CONNECTION_MODE names —
 # listens for incoming packets, and persists selected messages and channel
 # data into a SQLite database.
 #
 # The process is expected to run continuously; systemd will automatically
 # restart it if the collector exits or crashes.
+#
+# **This file is written for the serial default.** The two other modes each want
+# one more line, above in [Unit]:
+#
+#   tcp, with meshtasticd on this same host:
+#     After=meshtasticd.service
+#   Otherwise a reboot can start this unit against a daemon that has not bound
+#   its port yet, costing a restart cycle on every boot.
+#
+#   ble:
+#     After=bluetooth.service
+#   And the User below has to be in the `bluetooth` group and able to reach
+#   BlueZ over DBus. Pair the node before the first run — this process cannot
+#   answer a PIN prompt.
 #
 
 User=YOURUSERNAME
@@ -63,6 +78,13 @@ RestartSec=5
 # ---------------------------------------------------------------------------
 # Lightweight hardening (safe for serial-connected services)
 # ---------------------------------------------------------------------------
+#
+# "Safe for serial" is about serial specifically: these two do not stand between
+# the unit and a device file. They are equally safe for tcp, which needs only a
+# socket. For ble, keep in mind that BlueZ is reached over the system DBus — so
+# if you go on to add the stricter options this block deliberately leaves out
+# (PrivateUsers, RestrictAddressFamilies, IPAddressDeny), check them against a
+# BLE run rather than assuming, because that is the mode they can quietly break.
 
 NoNewPrivileges=true
 PrivateTmp=true

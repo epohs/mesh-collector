@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import signal
+import socket
 import sys
 import time
 import urllib.request
@@ -16,9 +17,10 @@ from meshtastic.protobuf import mesh_pb2, portnums_pb2
 from meshtastic.serial_interface import SerialInterface
 from pubsub import pub
 
-from mesh_collector import logfmt, selflog
+from mesh_collector import logfmt, selflog, transport
 from mesh_collector.config import Config
 from mesh_collector.db import Storage
+from mesh_collector.transport import BLE, TCP
 
 # The transmit path's types, for reading rather than for running. mesh-link is an
 # optional dependency — an archive-only install has none on its import path, which
@@ -75,6 +77,23 @@ FIRMWARE_RELEASES_URL = (
   "https://api.github.com/repos/meshtastic/firmware/releases?per_page=100"
 )
 FIRMWARE_LOOKUP_TIMEOUT = 5
+
+# How long to wait for a meshtasticd host to accept a connection, in tcp mode.
+#
+# This exists because TCPInterface does not bound its own connect:
+# `myConnect` calls `socket.create_connection(addr)` with no timeout
+# (tcp_interface.py:82-86), so it inherits the OS default — which for an
+# unroutable address is around seventy-five seconds of nothing on macOS, and
+# longer on Linux. A refused connection fails instantly, so this only bites the
+# host that is *silently* absent: a Pi that has not finished booting, a wrong
+# address, a firewall that drops rather than rejects. Under systemd that
+# difference is between a unit that exits and gets restarted and one that sits in
+# "activating" for a minute at a time.
+#
+# Five seconds because the realistic targets are localhost and a LAN address,
+# both of which answer in milliseconds; anything slower than this is not a
+# meshtasticd that will serve a reliable stream of packets anyway.
+TCP_CONNECT_TIMEOUT = 5
 
 
 
@@ -198,14 +217,22 @@ def _is_fabricated_identity(node_id: str, user: dict) -> bool:
 
 class MeshtasticCollector:
   """
-  Collects Meshtastic packets via serial interface and persists
+  Collects Meshtastic packets from an attached node and persists
   node metadata, channel messages, and direct messages to SQLite.
+
+  The node is reached over USB serial, TCP to a meshtasticd daemon, or BLE,
+  whichever CONNECTION_MODE names. All three of meshtastic's interface classes
+  subclass MeshInterface and everything below is typed against that API, so the
+  mode is decided once — in `transport`, before `start()` — and shows up here as
+  construction, one error tuple, and the label log lines name.
   """
 
   def __init__(self, db: Storage) -> None:
     self.storage = db
-    self.serial_port: str = Config.get("SERIAL_PORT")
-    self.interface: Optional[SerialInterface] = None
+    # Resolved before anything is opened, so a bad CONNECTION_MODE or a
+    # BLE_ADDRESS nobody filled in fails while the failure is still cheap.
+    self.transport = transport.from_config()
+    self.interface: Optional[MeshInterface] = None
     self._running = False
     self._connection_lost = False
     self._stopping = False
@@ -242,11 +269,18 @@ class MeshtasticCollector:
     self._nontext_counts: dict[tuple[int, str], int] = {}
     self._rx_summary_at = time.time()
 
+    # When the link last proved it was alive, for the LIVENESS_TIMEOUT watchdog.
+    # Written by the receive handlers on meshtastic's reader thread and read by
+    # the main loop: one float store, no lock, for the reason spelled out above
+    # the drop counters. Stamped now rather than at 0 so an enabled watchdog
+    # measures from startup instead of firing on its first pass.
+    self._last_activity = time.time()
+
 
 
 
   def start(self) -> None:
-    logging.info("Starting Meshtastic collector on %s", self.serial_port)
+    logging.info("Starting Meshtastic collector on %s", self.transport.label)
 
     # **A missing device is a condition, not a crash.** Unplugging the radio —
     # which a firmware update requires — used to print a thirty-line traceback
@@ -262,17 +296,19 @@ class MeshtasticCollector:
     # and forty ERRORs for one event teach a reader to skim past ERROR.
     #
     # OSError covers both the vanished /dev path (FileNotFoundError) and
-    # pyserial's SerialException, which subclasses it. MeshInterfaceError is
-    # the library's own "the port opened but no radio answered" — what a
-    # device sitting in its bootloader mid-flash looks like from here.
+    # pyserial's SerialException, which subclasses it; in tcp mode it is the
+    # refused or unroutable socket. MeshInterfaceError is the library's own "the
+    # port opened but no radio answered" — what a device sitting in its
+    # bootloader mid-flash looks like from here. _connect_errors adds BLE's,
+    # which are neither.
     try:
-      self.interface = SerialInterface(self.serial_port)
-    except (OSError, MeshInterface.MeshInterfaceError) as error:
+      self.interface = self._open_interface()
+    except self._connect_errors() as error:
       logging.warning(
         "No Meshtastic device answered at %s (%s). It may be unplugged, "
         "rebooting, or mid-flash; exiting so the service manager keeps "
         "retrying until it returns.",
-        self.serial_port,
+        self.transport.label,
         error,
       )
       self.storage.close()
@@ -331,6 +367,11 @@ class MeshtasticCollector:
     pub.subscribe(self._on_receive, "meshtastic.receive")
     pub.subscribe(self._on_node_updated, "meshtastic.node.updated")
     pub.subscribe(self._on_connection_lost, "meshtastic.connection.lost")
+    # Cheap observability on the transports that come and go. TCPInterface heals
+    # a blip inside the library by re-running myConnect() (tcp_interface.py:137-180)
+    # without telling anyone, so on TCP this line is the only trace that the link
+    # dropped and came back at all.
+    pub.subscribe(self._on_connection_established, "meshtastic.connection.established")
 
     self._running = True
     self._main_loop()
@@ -343,6 +384,79 @@ class MeshtasticCollector:
     if self._connection_lost:
       self.stop()
       sys.exit(1)
+
+
+
+
+  def _open_interface(self) -> MeshInterface:
+    """Construct the interface CONNECTION_MODE asked for.
+
+    **The tcp and ble imports are inside their branches on purpose.** A serial
+    install pays nothing for either, and more to the point `ble_interface` imports
+    bleak, which needs a working Bluetooth stack to import cleanly on some hosts —
+    a headless Pi archiving over USB should not fail to start over a radio it does
+    not use. `transport` already validated the arguments and named them the way
+    each constructor wants, so there is nothing to decide here.
+    """
+    if self.transport.mode == TCP:
+      self._check_tcp_reachable()
+      from meshtastic.tcp_interface import TCPInterface
+      return TCPInterface(**self.transport.kwargs)
+
+    if self.transport.mode == BLE:
+      from meshtastic.ble_interface import BLEInterface
+      return BLEInterface(**self.transport.kwargs)
+
+    return SerialInterface(**self.transport.kwargs)
+
+
+
+
+  def _check_tcp_reachable(self) -> None:
+    """Prove the meshtasticd port accepts a connection, within TCP_CONNECT_TIMEOUT.
+
+    A throwaway socket, opened and closed, purely so the *timeout* is ours — see
+    TCP_CONNECT_TIMEOUT for why the library's own connect cannot be bounded from
+    out here. Raises OSError (socket.timeout is one), which is already in
+    `_connect_errors`, so a failure lands in start()'s existing warning-and-exit
+    path with nothing special to say about it.
+
+    The port can of course close again between this probe and the real connect a
+    moment later. That race is not worth closing: what follows it is the
+    library's own OSError on the same path, which is exactly where an unreachable
+    host was always going to end up.
+    """
+    host = self.transport.kwargs["hostname"]
+    port = self.transport.kwargs["portNumber"]
+
+    with socket.create_connection((host, port), timeout=TCP_CONNECT_TIMEOUT):
+      pass
+
+
+
+
+  def _connect_errors(self) -> tuple[type[BaseException], ...]:
+    """What a failure to open this transport is allowed to look like.
+
+    **BLE's failures are `BLEInterface.BLEError`, which is neither an OSError nor
+    a bleak type** — `ble_interface.py:33` derives it straight from Exception. It
+    is what `find_device` raises for DEVICE_NOT_FOUND and MULTIPLE_DEVICES
+    (`:169-176`), which is what a wrong or stale BLE_ADDRESS actually produces, so
+    catching only BleakError here would miss the common case entirely and hand the
+    operator a traceback instead of the one-line warning above. BleakError stays in
+    the tuple for what escapes the library's own translation of it.
+
+    Both imports are lazy, and in ble mode only, for the same reason
+    `_open_interface` defers them.
+    """
+    errors: tuple[type[BaseException], ...] = (OSError, MeshInterface.MeshInterfaceError)
+
+    if self.transport.mode == BLE:
+      from bleak.exc import BleakError
+      from meshtastic.ble_interface import BLEInterface
+      errors += (BLEInterface.BLEError, BleakError)
+
+    return errors
 
 
 
@@ -377,7 +491,7 @@ class MeshtasticCollector:
       except Exception:
         # A vanished device can make close() itself raise; the database close
         # below and the nonzero exit still have to happen.
-        logging.exception("Failed to close the serial interface")
+        logging.exception("Failed to close the %s interface", self.transport.mode)
     self.storage.close()
 
 
@@ -496,10 +610,12 @@ class MeshtasticCollector:
 
 
   def _warn_if_mqtt_proxy_expected(self) -> None:
-    """Say so if the device is relying on its serial client to reach MQTT.
+    """Say so if the device is relying on its attached client to reach MQTT.
 
-    **The device asks whoever holds the serial port to do its publishing, and this
-    collector does not.** With `mqtt.proxy_to_client_enabled` set, the firmware sends
+    **The device asks whoever is attached as its client to do its publishing, and
+    this collector does not.** The proxy is a property of the client connection
+    rather than of the cable, so this holds identically over TCP and BLE.
+    With `mqtt.proxy_to_client_enabled` set, the firmware sends
     a `mqttClientProxyMessage` for its own traffic and for anything it gateways;
     `meshtastic-python` re-publishes that on a pubsub topic and speaks to no broker,
     and nothing here subscribes. So the packets go out over LoRa as normal and their
@@ -526,7 +642,7 @@ class MeshtasticCollector:
 
     logging.warning(
       "This device has MQTT client proxying on, and mesh-collector does not "
-      "provide it: while this collector holds the serial port the device's MQTT "
+      "provide it: while this collector is its attached client the device's MQTT "
       "uplink is off, for its own traffic and for anything it gateways. LoRa is "
       "unaffected. To stop relying on it, turn off Proxy to Client in the device's "
       "MQTT module settings (`meshtastic --set mqtt.proxy_to_client_enabled false`); "
@@ -585,13 +701,74 @@ class MeshtasticCollector:
     while self._running:
       if self.control_server is None:
         time.sleep(1)
+        self._check_liveness()
         continue
 
       pending = self.control_server.poll(timeout=CONTROL_POLL_INTERVAL)
+      self._check_liveness()
       if pending is None:
         continue
 
       self._answer_control_request(pending)
+
+
+
+
+  def _check_liveness(self) -> None:
+    """Probe a silent link, if LIVENESS_TIMEOUT asked us to. Off by default.
+
+    **This is not filling a hole the library ignores; it makes an existing
+    detection prompt.** A dropped TCP connection heals inside TCPInterface
+    (`_readBytes`/`_writeBytes` → `_reconnect()`, `tcp_interface.py:137-180`), a
+    refused reconnect raises out of the reader thread into `_disconnected()` and
+    so into our exit-1, and even a genuinely half-open socket is eventually
+    caught by the library's own 300s heartbeat (`mesh_interface.py:1170-1190`)
+    when that write exhausts the kernel's retransmits — on the order of fifteen
+    minutes. What this does is notice in LIVENESS_TIMEOUT seconds instead, and
+    say which transport it was.
+
+    Off by default for every mode, serial included: pyserial's reader death is
+    already immediate and reliable, so there is nothing here for it to improve.
+    It exists for TCP over a network that can go away quietly.
+
+    The send is `sendHeartbeat()` — the same no-op keepalive the library uses. An
+    exception means the link is gone, and it is routed through the existing
+    _connection_lost path rather than a second shutdown of its own, so a watchdog
+    loss and an unplug exit by exactly the same road.
+    """
+    timeout = self.transport.liveness_timeout
+    if not timeout or self.interface is None:
+      return
+
+    # Read once. The reader thread can store into _last_activity between the
+    # comparison and the log, and a heartbeat sent one interval early costs
+    # nothing while an inconsistent pair of reads would be a puzzle later.
+    silent_for = time.time() - self._last_activity
+    if silent_for < timeout:
+      return
+
+    logging.warning(
+      "Nothing heard on %s for %.0fs (LIVENESS_TIMEOUT=%ds); probing the link",
+      self.transport.label,
+      silent_for,
+      timeout,
+    )
+
+    # Stamped before the probe, not after: a link that is genuinely down but
+    # whose send blocks would otherwise re-probe on every pass of this loop.
+    self._last_activity = time.time()
+
+    try:
+      self.interface.sendHeartbeat()
+    except Exception as error:
+      logging.error(
+        "Liveness probe failed on %s (%s); shutting down so the service "
+        "manager restarts this collector",
+        self.transport.label,
+        error,
+      )
+      self._connection_lost = True
+      self._running = False
 
 
 
@@ -671,7 +848,7 @@ class MeshtasticCollector:
     from mesh_link import ERR_CHANNEL_NOT_TRACKED, ERR_SEND_FAILED
 
     if self.interface is None:
-      pending.fail(ERR_SEND_FAILED, "The collector has no serial interface open.")
+      pending.fail(ERR_SEND_FAILED, "The collector has no interface open.")
       return
 
     is_direct = request.is_direct
@@ -871,14 +1048,31 @@ class MeshtasticCollector:
 
 
 
+  def _on_connection_established(self, interface=None) -> None:
+    """The link is up. Logged for the transports that can come back by themselves."""
+    logging.info("Connection established on %s", self.transport.label)
+    self._last_activity = time.time()
+
+
+
+
   def _on_connection_lost(self, interface=None) -> None:
-    """The serial device is gone and meshtastic's reader thread has exited.
+    """The node is gone and meshtastic's reader thread has exited.
 
     Without this the process idles forever archiving nothing — alive as far as
     the service manager can tell, so Restart= never fires. Stop the main loop
     instead; start() sees _connection_lost and turns that into a nonzero exit.
     meshtastic publishes this with interface=, tolerated the same way
     _on_receive tolerates it.
+
+    **All three transports reach here, but BLE only by one line.** bleak's
+    disconnected_callback calls `BLEInterface.close()` (`ble_interface.py:192`),
+    and that close() ends with an explicit `self._disconnected()` (`:270`) which
+    is what publishes this event — `MeshInterface.close()` on its own does not
+    (`mesh_interface.py:143-148`). So BLE loss detection rests entirely on BLE's
+    own close(), in the library, not on anything here. Worth knowing before
+    concluding a walked-away node can leave this process alive-but-deaf: it
+    cannot.
     """
     # Our own close fires this event too — the reader thread exits identically
     # whether the device vanished or stop() dismissed it, and only this process
@@ -890,9 +1084,9 @@ class MeshtasticCollector:
       return
 
     logging.error(
-      "Serial connection lost on %s; shutting down so the service manager "
+      "Connection lost on %s; shutting down so the service manager "
       "restarts this collector",
-      self.serial_port,
+      self.transport.label,
     )
     self._connection_lost = True
     self._running = False
@@ -910,6 +1104,8 @@ class MeshtasticCollector:
     collector never hears another packet. So nothing may escape: an ordinary
     database error is logged and the packet is lost, not the process.
     """
+    self._last_activity = time.time()
+
     try:
       self._handle_receive(packet)
     except Exception:
@@ -1219,6 +1415,7 @@ class MeshtasticCollector:
     for interface= that _on_receive and _on_connection_lost already have, and
     leaves _on_node_update's own signature to its internal callers.
     """
+    self._last_activity = time.time()
     self._on_node_update(node)
 
 
@@ -1875,7 +2072,17 @@ def main() -> None:
 
   db = Storage()
 
-  collector = MeshtasticCollector(db=db)
+  # A misconfigured transport is an operator error, and a traceback is the wrong
+  # way to report one — especially under systemd, where it would be reprinted
+  # every RestartSec until somebody fixes config.json. One line, exit 1, same as
+  # the missing-device path in start().
+  try:
+    collector = MeshtasticCollector(db=db)
+  except transport.TransportError as error:
+    logging.error("Cannot start: %s", error)
+    db.close()
+    sys.exit(1)
+
   _install_signal_handlers(collector)
   collector.start()
 

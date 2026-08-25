@@ -74,19 +74,45 @@ uv sync
 
 Copy the [`mesh_collector/config-sample.json`](/mesh_collector/config-sample.json) file and create a new `config.json` file. I think the values are fairly self-explanatory with one exception.
 
+#### How the collector reaches your node
+
+`CONNECTION_MODE` chooses one of three, and it is `serial` unless you say otherwise. Only the settings for the mode you pick are read, so the other two can stay at whatever the sample has in them.
+
+#### Serial — a node on USB (default)
+
 The setting `SERIAL_PORT` in the example uses the device name for maximum compatibility, but this could be unreliable. For more reliable connectivity to your Meshtastic device, first ensure that it is connected to the host computer, then run: `ls -l /dev/serial/by-id/`
 
 You should see something like: `usb-RAKwireless_WisCore_RAK4631_Board_1X2X3X4X5X6X-if00 -> ../../ttyACM0`
 
 Use that value in your own `config.json` using `“SERIAL_PORT”: “/dev/serial/by-id/YOUR_DEVICE_ID”,` instead of the `/dev/DEVICE_NAME` that I have in my example.
 
-#### Local development on macOS
+##### Local development on macOS
 
 Everything above assumes the Raspberry Pi, which is where this actually runs. If you are developing on a Mac, `/dev/serial/by-id/` will not be there — it is a Linux `udev` feature, and macOS has no equivalent. Your device shows up directly in `/dev` instead, so run `ls /dev/cu.usbmodem*` and use what you find, something like `“SERIAL_PORT”: “/dev/cu.usbmodem101”,`.
 
 Use the `cu.` name and not the `tty.` one beside it. They are the same device, but opening the `tty.` form blocks waiting for carrier detect, and the collector will simply hang at startup with no error to explain itself.
 
 The port number is assigned when the device is plugged in and is not stable across reboots or a different USB port, so expect to update it occasionally. That is a good reason to keep macOS a development-only arrangement and leave deployment on the Pi, where `by-id` gives you a name that does not move.
+
+#### TCP — a node running `meshtasticd`
+
+Set `CONNECTION_MODE` to `tcp` and point `TCP_HOST` and `TCP_PORT` at the daemon; `localhost` and `4403` are its defaults, which is what you want when `meshtasticd` runs on the same machine as the collector. Nothing needs to be in `/dev` and no group membership is involved.
+
+`meshtasticd` serves one client at a time, exactly as a serial port does, so the same rule applies: while this collector is attached, nothing else can be.
+
+If both run on the same host under systemd, give the collector unit `After=meshtasticd.service`. Without it a reboot can start the collector against a daemon that has not bound its port yet, which costs a restart cycle every boot.
+
+#### BLE — a node over Bluetooth
+
+Set `CONNECTION_MODE` to `ble` and `BLE_ADDRESS` to the node's address or its advertised name. `meshtastic --ble-scan` lists what is in range. There is no default worth shipping, so this one has to be filled in — a blank `BLE_ADDRESS` stops the collector at startup rather than letting it attach to whichever node happened to answer first.
+
+Pair the host with the node before the first run. The collector cannot answer a PIN prompt, and an unpaired node fails with the library's own message about the `bluetooth` group and the PIN — which on Linux is also the hint worth taking literally: the user running the collector needs to be in `bluetooth` and able to reach BlueZ over DBus.
+
+Unlike serial and TCP, BLE is not exclusive — a node serves BLE while a USB cable is attached and busy. That is what makes it the easy one to try first.
+
+#### Watching for a link that goes quiet
+
+`LIVENESS_TIMEOUT` is off (`0`) by default and can stay that way for serial, where a disconnect is noticed immediately. It is there for TCP over a network that can disappear without closing the socket: after that many seconds of hearing nothing at all, the collector sends a heartbeat, and a failure exits so the service manager restarts it. The library eventually notices such a link on its own — this only makes it prompt.
 
 All config options are documented in [`config.py`](/mesh_collector/config.py).
 
@@ -110,7 +136,7 @@ The database will be created and migrated automatically if needed. Nodes and mes
 
 ### Transmitting (optional, off by default)
 
-The collector owns the serial port, so it is also the only thing that can send. It does not do that unless you ask it to, and asking takes two separate steps — a collector that skips either one is receive-only, exactly as it was before this existed.
+The collector is the node's attached client, so it is also the only thing that can send — over serial and over TCP that is because the node accepts one client at a time, and over BLE because it is the client that is there. It does not do that unless you ask it to, and asking takes two separate steps — a collector that skips either one is receive-only, exactly as it was before this existed.
 
 First install it with the transmit extra, which pulls in [Mesh Link](https://github.com/epohs/mesh-link):
 

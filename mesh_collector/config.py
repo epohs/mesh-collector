@@ -26,7 +26,12 @@ COLLECTOR_CONFIG = {
   "MAX_DIRECT_MESSAGES": 1000,        # Max direct messages to keep
   "PRUNE_INTERVAL": 25,               # Prune database every X inserts
   "NODE_PRUNE_DAYS": 14,              # Nodes unseen in X days will be pruned
-  "SERIAL_PORT": "/dev/ttyACM0",      # Meshtastic serial device location
+  "CONNECTION_MODE": "serial",        # How to reach the node: serial | tcp | ble
+  "SERIAL_PORT": "/dev/ttyACM0",      # Meshtastic serial device location (serial mode)
+  "TCP_HOST": "localhost",            # meshtasticd host (tcp mode)
+  "TCP_PORT": 4403,                   # meshtasticd port (tcp mode)
+  "BLE_ADDRESS": "",                  # BLE MAC address or advertised name (ble mode)
+  "LIVENESS_TIMEOUT": 0,              # Seconds of silence before probing the link; 0 disables
   "STORE_DIRECT_MESSAGES": False,     # Should the collector archive direct messages
   "LOG_PRIMARY_CHANNEL": True,        # Should we track primary channel messages
   "PRIMARY_CHANNEL": 0,               # Primary channel index (usually 0)

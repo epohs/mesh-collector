@@ -10,9 +10,13 @@
 ### Meshtastic Collector Service
 
 This systemd unit runs the RxOnly Meshtastic collector as a persistent
-background service. The collector connects to a locally attached Meshtastic
-device over a serial interface and stores received messages and selected
-channel data in a SQLite database.
+background service. The collector connects to a Meshtastic node — over a local
+serial interface, over TCP to a `meshtasticd` daemon, or over BLE, whichever
+`CONNECTION_MODE` names — and stores received messages and selected channel
+data in a SQLite database.
+
+The unit below is written for the serial default. TCP and BLE each want one
+extra line in it; both are noted in the unit's own comments.
 
 The service is designed to run continuously and is automatically restarted
 by systemd if the collector exits or crashes.
