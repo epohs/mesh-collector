@@ -2660,7 +2660,9 @@ class MeshtasticCollector:
 
 
 
-  def _channel_hash_name(self, channel, index: int, primary_channel: int) -> Optional[str]:
+  def _channel_hash_name(
+    self, channel, index: int, primary_channel: int, local_node
+  ) -> Optional[str]:
     """The name the *firmware* hashes this channel under, or None.
 
     Not the same string as the display name and deliberately derived apart from
@@ -2684,7 +2686,15 @@ class MeshtasticCollector:
       # firmware, which is a legal channel and a computable hash.
       return ""
 
-    local_config = getattr(self.interface, "localConfig", None)
+    # **On the node, not on the interface.** `MeshInterface` has no `localConfig`
+    # of its own — it writes the device's answer into `localNode.localConfig`
+    # (mesh_interface.py:1423), and the library's own modem-preset read goes
+    # through the node too (mesh_interface.py:1015). Reaching for it on the
+    # interface returns None on every radio there is, which is not an error and
+    # produced no log line: the primary channel simply never got a hash, on a
+    # mesh where the primary channel is the busiest one. Caught by deploying it
+    # and reading the `Channel hashes:` line, which is what that line is for.
+    local_config = getattr(local_node, "localConfig", None)
     if local_config is None:
       return None
 
@@ -2702,7 +2712,9 @@ class MeshtasticCollector:
 
 
 
-  def _build_channel_labels(self, device_channels: dict, primary_channel: int) -> None:
+  def _build_channel_labels(
+    self, device_channels: dict, primary_channel: int, local_node
+  ) -> None:
     """Fill `channel_names` and `channel_hashes` from the device's channel list.
 
     Wrapped in its own try per channel for the same reason `_sync_channels` is:
@@ -2734,7 +2746,7 @@ class MeshtasticCollector:
         else:
           self.channel_names[index] = f"Channel {index}"
 
-        hash_name = self._channel_hash_name(channel, index, primary_channel)
+        hash_name = self._channel_hash_name(channel, index, primary_channel, local_node)
         if hash_name is None:
           continue
 
@@ -2853,7 +2865,7 @@ class MeshtasticCollector:
     # summary has to be able to say which. Built before that loop so a per-channel
     # write failure below cannot cost the labels; nothing here touches the
     # archive, so nothing here can fail in a way worth aborting a sync for.
-    self._build_channel_labels(device_channels, primary_channel)
+    self._build_channel_labels(device_channels, primary_channel, local_node)
 
     # The per-channel try covers the name derivation as well as the write. A
     # channel object the library hands back in an unexpected shape raises in the
