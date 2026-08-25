@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
@@ -7,6 +8,7 @@ import re
 import signal
 import socket
 import sys
+import threading
 import time
 import urllib.request
 
@@ -57,6 +59,32 @@ CONTROL_POLL_INTERVAL = 1.0
 # watching.
 RX_SUMMARY_INTERVAL = 900
 RX_SUMMARY_MAX_DROPS = 50
+
+# How long the liveness probe waits for the radio to answer before calling the
+# link gone.
+#
+# **The deadline is the point of the probe, not a detail of it.** `sendHeartbeat`
+# reaches `BLEClient.write_gatt_char`, which is `async_await(coro)` with
+# `timeout=None` (`ble_interface.py:307`), which is `future.result(None)`
+# (`:339`) — a wait that cannot expire. There is no argument that changes this;
+# `sendHeartbeat` takes none. So the bound has to be ours, and the probe runs on
+# a thread we can walk away from rather than on the main loop, where a write that
+# never returns parks the whole collector inside the watchdog that was supposed to
+# be protecting it.
+#
+# Ten seconds, against a measured ~0.2s for a healthy BLE write — fifty times the
+# headroom, which matters because a TCP heartbeat can legitimately sit inside
+# TCPInterface's own reconnect for a few seconds and must not be shot for it.
+LIVENESS_PROBE_DEADLINE = 10.0
+
+# The ceiling on the BLE retry backoff. A drop that outlasts a minute is not
+# getting better on the timescale doubling can chase, and by then the attempt
+# count is the thing about to end this process anyway.
+RECONNECT_BACKOFF_CAP = 60
+
+# "The library does not have this field", as distinct from "the field is None",
+# which several of them legitimately are. Only `_ble_link_down_reason` needs it.
+_UNREADABLE = object()
 
 # Where the firmware release channel comes from. The device reports its version
 # with a build hash ('2.7.26.54e0d8d') and nothing else — whether that build is
@@ -236,6 +264,20 @@ class MeshtasticCollector:
     self._running = False
     self._connection_lost = False
     self._stopping = False
+    # Set while _reconnect_ble is rebuilding the interface. It guards the same
+    # door _stopping guards and for a sharper reason: a *failed* reopen calls
+    # `close()` on the half-built object (`ble_interface.py:74`), and BLE's
+    # close() ends in `self._disconnected()` (`:271`), which publishes
+    # meshtastic.connection.lost. We are subscribed by then, so without this flag
+    # every unsuccessful retry would arrive at _on_connection_lost as a fresh
+    # loss and stop the loop the retry is running inside.
+    self._reconnecting = False
+    # Set by _on_ble_disconnected, on bleak's event loop thread, and cleared by
+    # the main loop. A plain bool store and load, no lock, for the reason the drop
+    # counters give below.
+    self._ble_disconnected = False
+    # Reopened links, for the one line at shutdown that answers "did it hold?".
+    self._reconnect_count = 0
     self.local_node_id: Optional[str] = None
     self.tracked_channels: list[int] = self._tracked_channel_indexes()
 
@@ -314,6 +356,8 @@ class MeshtasticCollector:
       self.storage.close()
       sys.exit(1)
 
+    self._watch_for_ble_disconnect()
+
     # **A collector that cannot describe its channels must not archive into
     # them.** Nothing is in flight yet — the control socket is not listening and
     # the receive handlers are not subscribed until further down — so exiting
@@ -376,11 +420,25 @@ class MeshtasticCollector:
     self._running = True
     self._main_loop()
 
-    # The loop only falls out here when _on_connection_lost stopped it — a
-    # signal exits from inside its own handler and never returns this far. Exit
-    # nonzero so Restart= in the service unit fires: the reconnect is the
-    # restart. In-process reconnect-with-backoff was the alternative and was
-    # not taken; systemd already owns the retry policy.
+    # The loop only falls out here when _on_connection_lost or _supervise_ble_link
+    # stopped it — a signal exits from inside its own handler and never returns
+    # this far. Exit nonzero so Restart= in the service unit fires: the reconnect
+    # is the restart. In-process reconnect-with-backoff was the alternative and
+    # was not taken; systemd already owns the retry policy.
+    #
+    # **That is still the policy for serial and TCP, and it is no longer the whole
+    # policy.** BLE reaches this line only after `_reconnect_ble` has used up
+    # BLE_RECONNECT_ATTEMPTS, because on BLE the premises above do not hold: the
+    # library reports no drop at all, so nothing was ever stopping this loop, and
+    # a restart is not cheap — it re-runs channel sync, the node sync and the
+    # firmware read for a radio that is usually back within seconds. The reasoning
+    # for exit-1 was written for a vanished USB device and it is still right about
+    # one; it was never right about a node someone walked out of range of.
+    #
+    # The exit stays as the backstop rather than being replaced by the retry
+    # loop, and that ordering is the load-bearing part: a recovery that never
+    # gives up is how a dead radio becomes a process that looks healthy forever,
+    # which is the exact outcome exit-1 was chosen to prevent.
     if self._connection_lost:
       self.stop()
       sys.exit(1)
@@ -485,6 +543,19 @@ class MeshtasticCollector:
         logging.exception("Failed to close the control socket")
       self.control_server = None
 
+    # **A BLE link that is already down must be abandoned, never closed.** Closing
+    # it waits on an event loop that a dropped BLE link has usually already
+    # deadlocked (the chain is written out at `_watch_for_ble_disconnect`), and
+    # that wait does not time out — so a shutdown arriving in the window between
+    # the drop and the main loop noticing it would hang here, `systemctl stop`
+    # would sit out its timeout, and the process would leave by SIGKILL. The
+    # `except` below cannot help with that; a block is not an exception.
+    if self.interface is not None and self.transport.mode == BLE:
+      down = self._ble_link_down_reason()
+      if down is not None:
+        logging.info("Abandoning the %s interface: %s", self.transport.label, down)
+        self._abandon_interface()
+
     if self.interface:
       try:
         self.interface.close()
@@ -492,6 +563,15 @@ class MeshtasticCollector:
         # A vanished device can make close() itself raise; the database close
         # below and the nonzero exit still have to happen.
         logging.exception("Failed to close the %s interface", self.transport.mode)
+
+    if self._reconnect_count:
+      logging.info(
+        "Reopened %s %d time%s this run",
+        self.transport.label,
+        self._reconnect_count,
+        "" if self._reconnect_count == 1 else "s",
+      )
+
     self.storage.close()
 
 
@@ -701,15 +781,395 @@ class MeshtasticCollector:
     while self._running:
       if self.control_server is None:
         time.sleep(1)
-        self._check_liveness()
+        self._check_link()
         continue
 
       pending = self.control_server.poll(timeout=CONTROL_POLL_INTERVAL)
-      self._check_liveness()
+      self._check_link()
       if pending is None:
         continue
 
       self._answer_control_request(pending)
+
+
+
+
+  def _check_link(self) -> None:
+    """One pass of link supervision, cheapest check first.
+
+    Two things happen here and the order matters. `_supervise_ble_link` reads
+    state that is already sitting in memory and costs nothing, so it runs every
+    pass; `_check_liveness` sends a packet and is off unless an operator asked for
+    it. When supervision acts — because the link went and was rebuilt, or because
+    it went and this process is now on its way out — there is nothing for the
+    silence watchdog to measure, so it is skipped for that pass.
+    """
+    if self._supervise_ble_link():
+      return
+
+    self._check_liveness()
+
+
+
+
+  def _watch_for_ble_disconnect(self) -> None:
+    """Take over bleak's disconnect callback, because the library's deadlocks.
+
+    **This is the fix for the whole silent-death mode, and it is worth reading
+    the chain before touching it.** meshtastic connects with
+    `disconnected_callback=lambda _: self.close()` (`ble_interface.py:194`).
+    bleak's CoreBluetooth backend delivers that callback by posting
+    `did_disconnect_peripheral` to the BLEClient's own asyncio loop
+    (`CentralManagerDelegate.py:177`) and calling it there (`:402`), so it runs
+    **on the event loop thread**. `BLEInterface.close()` immediately calls
+    `MeshInterface.close()`, which calls `_sendDisconnect()`, which reaches
+    `write_gatt_char` → `async_await` → `run_coroutine_threadsafe(...).result(None)`:
+    a wait, on the loop thread, for a coroutine only that loop can run.
+
+    It never returns. Three things follow, and all three were measured on hardware
+    before they were understood:
+
+    - the event loop is dead from the first disconnect onward, so every later GATT
+      call from any thread blocks forever — the read loop, the liveness probe, and
+      our own `close()` alike;
+    - `close()` never reaches its `self._disconnected()` (`:271`), which is the
+      **only** publisher of meshtastic.connection.lost on BLE, so a dropped BLE
+      link reports nothing and `_on_connection_lost` never runs;
+    - `close()` never reaches its `atexit.unregister` (`:267`) either, so the
+      exit handler registered at `:97` — `client.disconnect`, on the dead loop —
+      is still armed, and a later `sys.exit(1)` hangs in atexit instead of
+      exiting. The nonzero-exit backstop is booby-trapped by the same deadlock it
+      is supposed to catch.
+
+    Replacing the callback with one that only stores a flag removes all three at
+    the source: the loop stays alive, so the interface can still be closed, and
+    the drop is known within a pass of the main loop.
+
+    Reaching `_backend` is the one private attribute this file depends on.
+    `set_disconnected_callback` is a documented method of bleak's base client
+    (`backends/client.py:63`) and the CoreBluetooth backend reads the callback at
+    call time rather than capturing it at connect time, so installing it after
+    construction works. If a future bleak moves it, this degrades to the polling
+    below — which is why detection does not rest on this alone.
+    """
+    if self.transport.mode != BLE or self.interface is None:
+      return
+
+    self._ble_disconnected = False
+
+    backend = getattr(
+      getattr(getattr(self.interface, "client", None), "bleak_client", None),
+      "_backend",
+      None,
+    )
+    if backend is None or not hasattr(backend, "set_disconnected_callback"):
+      logging.warning(
+        "Could not install the BLE disconnect hook on %s; falling back to "
+        "polling the link, which still detects a drop but leaves the library's "
+        "own callback free to deadlock its event loop",
+        self.transport.label,
+      )
+      return
+
+    backend.set_disconnected_callback(self._on_ble_disconnected)
+
+
+
+
+  def _on_ble_disconnected(self) -> None:
+    """The peripheral went away. Runs on bleak's event loop thread.
+
+    **It stores one bool and returns, and that is the entire contract.** This is
+    the callback whose library-supplied version deadlocks the loop it runs on
+    (see `_watch_for_ble_disconnect`); anything that blocks here reintroduces
+    exactly that bug, and anything that raises escapes into bleak's callback
+    dispatch. The journal line and every decision about what to do next belong to
+    the main loop, which reads this flag in `_ble_link_down_reason` — that is also
+    why there is no logging call here, since a log write is I/O and I/O is what
+    must not happen on this thread.
+    """
+    self._ble_disconnected = True
+
+
+
+
+  def _ble_link_down_reason(self) -> Optional[str]:
+    """Why the BLE link looks dead, or None if it looks fine.
+
+    Three signals, none of which touches the event loop, because on a dropped BLE
+    link the event loop may already be wedged and anything that waits on it never
+    comes back:
+
+    1. **Our disconnect hook fired.** The strongest signal — the host's Bluetooth
+       stack said the peripheral is gone.
+    2. **`is_connected` is false.** A public bleak property that is a plain state
+       read on both backends that matter: CoreBluetooth compares
+       `_peripheral.state()` (`corebluetooth/client.py:158-164`) and BlueZ returns
+       a bool kept current by DBus signals (`bluezdbus/client.py:543-550`).
+       Neither awaits anything, so this answers even when the loop is dead — and
+       it is the signal that survives the hook failing to install.
+    3. **The read thread has exited.** bleak fails every pending delegate future
+       with `BleakError("disconnected")` before it calls the disconnect callback
+       (`corebluetooth/client.py:124-132`), and meshtastic re-raises a non-"Not
+       connected" BleakError straight out of `_receiveFromRadioImpl`
+       (`ble_interface.py:218-222`), so an in-flight read kills the thread. This
+       also catches the unprovoked `TimeoutError` death that was observed with no
+       disconnect behind it at all.
+
+    Cheap first, and each one is sufficient on its own. None is sufficient
+    *alone*: (1) needs the hook, (2) is the one that always works, and (3) fires
+    only when a read was in flight — on a quiet mesh the thread is asleep in its
+    `should_read` poll and stays alive over a drop.
+
+    **Anything unreadable is reported as healthy.** A missing attribute means the
+    library changed shape, and a supervisor that tears down a working link because
+    it could not find a field is worse than one that misses a drop the other two
+    signals will catch a moment later.
+    """
+    if self._ble_disconnected:
+      return "the host's Bluetooth stack reported the peripheral disconnected"
+
+    client = getattr(self.interface, "client", None)
+    bleak_client = getattr(client, "bleak_client", None)
+    if bleak_client is not None:
+      try:
+        connected = bleak_client.is_connected
+      except Exception:
+        connected = True
+      if not connected:
+        return "the peripheral is no longer connected"
+
+    # **The sentinel is doing real work here.** `_receiveThread` is legitimately
+    # None on a closed interface (`ble_interface.py:264`), so None has to mean
+    # "gone" — but an *absent* attribute means the library renamed the field, and
+    # reading that as "gone" would tear a healthy link down on the first pass of
+    # every main loop and spend the whole reconnect budget in five seconds.
+    thread = getattr(self.interface, "_receiveThread", _UNREADABLE)
+    if thread is _UNREADABLE:
+      return None
+    if thread is None or not thread.is_alive():
+      return "the library's BLE read thread has exited"
+
+    return None
+
+
+
+
+  def _supervise_ble_link(self) -> bool:
+    """Notice a dropped BLE link and act on it. True if it acted.
+
+    **BLE is the exception to this collector's exit-1 reconnect policy, and this
+    is where the exception lives.** Serial and TCP still exit and let the service
+    manager reconnect — see the note at `start()`'s exit path — because on those
+    a drop is rare, reported immediately, and cheap to restart out of. BLE is
+    none of the three: `BLEInterface` has no reconnect, the library reports
+    nothing at all, and a restart re-runs channel sync, the node sync and the
+    firmware read for a radio that is usually back in seconds.
+
+    The exit is still the backstop, not a thing that was removed. Recovery is
+    bounded by BLE_RECONNECT_ATTEMPTS, and running out falls through to exactly
+    the nonzero exit that was there before.
+    """
+    if self.transport.mode != BLE or self.interface is None:
+      return False
+
+    # A deliberate stop tears the interface down on another thread, and a reopen
+    # in progress is allowed to look disconnected — that is what it is.
+    if self._stopping or self._reconnecting:
+      return False
+
+    reason = self._ble_link_down_reason()
+    if reason is None:
+      return False
+
+    logging.error("Link lost on %s: %s", self.transport.label, reason)
+
+    self._abandon_interface()
+
+    if not self._reconnect_ble():
+      self._connection_lost = True
+      self._running = False
+
+    return True
+
+
+
+
+  def _abandon_interface(self) -> None:
+    """Drop a BLE interface without closing it, and disarm what it left behind.
+
+    **Not calling `close()` is the point.** On a dropped BLE link the library's
+    own disconnect callback is usually already parked inside `close()` on the
+    event loop thread, and `close()` is not re-entrant across that: calling it
+    from here would queue a second coroutine on a loop that will never run
+    another one, and block the main thread forever alongside it. Even where the
+    disconnect hook prevented that deadlock, the peripheral is gone, so the
+    disconnect packet `MeshInterface.close()` tries to send has nowhere to go.
+
+    What does have to happen is the atexit handler. `BLEInterface` registers
+    `client.disconnect` at `ble_interface.py:97` and only ever unregisters it
+    inside `close()` (`:267`) — which is precisely the call being skipped. Left
+    armed, it runs at interpreter shutdown, waits on the dead loop, and hangs the
+    process in `sys.exit(1)`: the nonzero exit that the whole recovery design
+    keeps as its backstop would never actually exit. One handler per abandoned
+    interface, so a soak that reconnects forty times arms forty of them.
+
+    `_want_receive = False` asks the read thread to stop if it is still alive. It
+    is best-effort — a thread blocked in a GATT read on the dead loop will not
+    see it, and there is no way to make it — but on the quiet-mesh path, where
+    the thread is sleeping in its `should_read` poll, this is what ends it.
+
+    The heartbeat timer has to be cancelled here for the same reason as the
+    atexit handler: `MeshInterface._startHeartbeat` arms a 300s
+    `threading.Timer` (`mesh_interface.py:1170-1180`) that re-arms itself
+    forever, and the only thing that ever cancels it is `close()` (`:145-146`) —
+    again the call this method exists to skip. Left armed it fires about five
+    minutes later against a client that has been torn down and dies with an
+    unhandled traceback; measured, that is a 45-line `BleakError: Service
+    Discovery has not been performed yet` in the journal roughly five minutes
+    after *every* BLE recovery. Nothing breaks, but it is exactly the kind of
+    thing that gets read as the failure. This cancel is best-effort for its own
+    second reason: the timer's callback sets `self.heartbeatTimer = None` before
+    building its replacement, so a cancel landing inside that window reads None
+    and misses. That is a millisecond hole every 300s, and the cost of losing
+    the race is one log traceback, not a fault.
+    """
+    interface = self.interface
+    self.interface = None
+    if interface is None:
+      return
+
+    handler = getattr(interface, "_exit_handler", None)
+    if handler is not None:
+      atexit.unregister(handler)
+
+    try:
+      interface._want_receive = False  # pylint: disable=protected-access
+    except Exception:
+      logging.debug("Could not stop the read loop on the abandoned interface")
+
+    try:
+      timer = getattr(interface, "heartbeatTimer", None)
+      if timer is not None:
+        timer.cancel()
+    except Exception:
+      logging.debug("Could not cancel the heartbeat timer on the abandoned interface")
+
+
+
+
+  def _reconnect_ble(self) -> bool:
+    """Rebuild the BLE interface, with backoff, up to the configured cap.
+
+    True if the link is back and the caller should carry on; False if it is out
+    of attempts and the caller should take the exit.
+
+    **A new object every time.** `BLEInterface` cannot be reconnected — its read
+    loop sets `_want_receive = False` and returns, and nothing in the class puts
+    it back — so recovery means construction, with the same 10s scan and the same
+    `_connect_errors` tuple the first connect used.
+
+    **This blocks the main loop, deliberately.** The control socket is not drained
+    while a reopen is in progress, so a queued send waits out the backoff. That is
+    the honest behaviour: there is no radio to send with, and answering a transmit
+    request during a reconnect would mean accepting work that cannot be done.
+
+    **What this does not redo, on purpose.** Channel sync, the initial node sync
+    and the firmware read do not run again. BLE_ADDRESS pins the radio, so the
+    device that answers a reopen is the device that dropped, and its channels are
+    the ones already in the archive. The honest cost is that a node reconfigured
+    or reflashed *while the link was down* keeps its old channel and firmware rows
+    until the next restart — a rare trade for not putting three more ways to fail
+    inside a recovery path, and the reason it is written down rather than assumed.
+
+    Expect **two** journal lines per recovery. `_on_connection_established` fires
+    on a rebuild — unlike at startup, where the interface is constructed before
+    that subscription exists, which is why a first connect never logs one — and
+    this method logs its own besides. They are not redundant: the library's line
+    says a link came up, and this one says it was a recovery, which attempt won,
+    and how many times that has happened since the process started.
+    """
+    attempts = self.transport.reconnect_attempts
+    if not attempts:
+      return False
+
+    self._reconnecting = True
+    try:
+      delay = self.transport.reconnect_backoff
+
+      for attempt in range(1, attempts + 1):
+        # **The first attempt is immediate, and the backoff sits between the
+        # rest.** The drop this is most often answering is a node that walked out
+        # of range and back, where the link is available again the moment anyone
+        # asks; and `BLEInterface` opens with a 10s scan regardless, so even the
+        # immediate attempt gives the stack time to settle. Doubling after the
+        # wait rather than after the failure is what makes the first gap the
+        # configured one instead of twice it.
+        if attempt > 1:
+          if not self._sleep_before_retry(delay):
+            return False
+          delay = min(delay * 2, RECONNECT_BACKOFF_CAP)
+
+        logging.info(
+          "Reopening %s (attempt %d of %d)", self.transport.label, attempt, attempts
+        )
+
+        # Cleared before the attempt, not after: the hook belonging to the old
+        # client can still fire while this one is being built, and a flag set by
+        # a dead link must not be read as the new link having dropped.
+        self._ble_disconnected = False
+
+        try:
+          self.interface = self._open_interface()
+        except self._connect_errors() as error:
+          # WARNING, not ERROR, for the reason start()'s open gives: the error
+          # was the drop, reported once when it happened, and a retry that did
+          # not work is the same condition continuing.
+          logging.warning(
+            "Could not reopen %s (%s)", self.transport.label, error
+          )
+          self.interface = None
+          continue
+
+        self._watch_for_ble_disconnect()
+        self._last_activity = time.time()
+        self._reconnect_count += 1
+
+        logging.info(
+          "Link re-established on %s after %d attempt%s (%d since startup)",
+          self.transport.label,
+          attempt,
+          "" if attempt == 1 else "s",
+          self._reconnect_count,
+        )
+        return True
+    finally:
+      self._reconnecting = False
+
+    logging.error(
+      "Gave up reopening %s after %d attempts; exiting so the service manager "
+      "keeps retrying until the radio returns",
+      self.transport.label,
+      attempts,
+    )
+    return False
+
+
+
+
+  def _sleep_before_retry(self, delay: int) -> bool:
+    """Wait out the backoff in one-second slices. False if we should stop trying.
+
+    Sliced rather than slept in one go so that a SIGTERM arriving mid-backoff is
+    acted on now instead of up to a minute later — the signal handler runs
+    `stop()`, which clears `_running`, and this is what notices.
+    """
+    for _ in range(delay):
+      if not self._running:
+        return False
+      time.sleep(1)
+
+    return self._running
 
 
 
@@ -735,6 +1195,26 @@ class MeshtasticCollector:
     exception means the link is gone, and it is routed through the existing
     _connection_lost path rather than a second shutdown of its own, so a watchdog
     loss and an unplug exit by exactly the same road.
+
+    **This is not BLE's drop detector and must not be described as one.** It was
+    written as though it were, and on hardware it did the opposite: the probe's
+    write blocked instead of raising and parked the whole collector inside this
+    method, 155 seconds of dead link with nothing noticed and nothing exited.
+    `_probe_link` is the answer to the blocking half — it bounds the wait this
+    file cannot bound any other way — but the detector is
+    `_ble_link_down_reason`, which costs nothing and cannot false-positive.
+
+    That second property is why this stays off by default on BLE too. The trigger
+    here is *silence*, and a minute of silence is ordinary on a quiet mesh: a 60s
+    timeout was measured firing at +61.2s against a link that was perfectly
+    healthy. A probe that mostly reports on links that were fine is a poor trade
+    for a watchdog that only has to say something when something is wrong.
+
+    **On BLE a failed probe reports rather than exits.** It sets the same flag the
+    disconnect hook sets, so the next pass of `_supervise_ble_link` handles it
+    like any other drop — reopen, and exit only if that runs out of attempts.
+    Serial and TCP keep the original behaviour, which is to stop the loop and let
+    the exit path fire.
     """
     timeout = self.transport.liveness_timeout
     if not timeout or self.interface is None:
@@ -758,17 +1238,62 @@ class MeshtasticCollector:
     # whose send blocks would otherwise re-probe on every pass of this loop.
     self._last_activity = time.time()
 
-    try:
-      self.interface.sendHeartbeat()
-    except Exception as error:
-      logging.error(
-        "Liveness probe failed on %s (%s); shutting down so the service "
-        "manager restarts this collector",
-        self.transport.label,
-        error,
-      )
-      self._connection_lost = True
-      self._running = False
+    failure = self._probe_link()
+    if failure is None:
+      return
+
+    if self.transport.mode == BLE:
+      logging.warning("Liveness probe failed on %s (%s)", self.transport.label, failure)
+      self._ble_disconnected = True
+      return
+
+    logging.error(
+      "Liveness probe failed on %s (%s); shutting down so the service "
+      "manager restarts this collector",
+      self.transport.label,
+      failure,
+    )
+    self._connection_lost = True
+    self._running = False
+
+
+
+
+  def _probe_link(self) -> Optional[str]:
+    """Send a heartbeat with a deadline of our own. None if the radio answered.
+
+    **The thread is not decoration.** `sendHeartbeat` offers no timeout and, on
+    BLE, ends in a `future.result(None)` that cannot expire; putting it on a
+    thread is the only way to stop waiting for it, because there is nothing to
+    interrupt and nothing to cancel. A probe that overruns is abandoned, not
+    killed — Python cannot kill a thread — so it stays parked on whatever it was
+    parked on, holding a little memory, until the process ends.
+
+    That leak is real and it is bounded on purpose. A probe only overruns on a
+    link that is already gone, and a gone link is about to be either reopened by
+    `_reconnect_ble` — which is capped — or exited out of. What must not happen
+    is an unbounded retry policy above an unbounded probe, which is how a
+    collector accumulates wedged threads for days and still reports itself
+    healthy.
+    """
+    outcome: list[str] = []
+
+    def probe() -> None:
+      try:
+        self.interface.sendHeartbeat()
+      except Exception as error:  # pylint: disable=broad-except
+        outcome.append(str(error) or error.__class__.__name__)
+      else:
+        outcome.append("")
+
+    thread = threading.Thread(target=probe, name="LivenessProbe", daemon=True)
+    thread.start()
+    thread.join(LIVENESS_PROBE_DEADLINE)
+
+    if thread.is_alive():
+      return f"no answer within {LIVENESS_PROBE_DEADLINE:.0f}s"
+
+    return outcome[0] if outcome and outcome[0] else None
 
 
 
@@ -1065,14 +1590,21 @@ class MeshtasticCollector:
     meshtastic publishes this with interface=, tolerated the same way
     _on_receive tolerates it.
 
-    **All three transports reach here, but BLE only by one line.** bleak's
-    disconnected_callback calls `BLEInterface.close()` (`ble_interface.py:192`),
-    and that close() ends with an explicit `self._disconnected()` (`:270`) which
-    is what publishes this event — `MeshInterface.close()` on its own does not
-    (`mesh_interface.py:143-148`). So BLE loss detection rests entirely on BLE's
-    own close(), in the library, not on anything here. Worth knowing before
-    concluding a walked-away node can leave this process alive-but-deaf: it
-    cannot.
+    **Serial and TCP reach here. BLE does not, and cannot.** This docstring used
+    to claim the opposite — that bleak's disconnected_callback calls
+    `BLEInterface.close()`, whose `self._disconnected()` (`ble_interface.py:271`)
+    publishes this event, so a walked-away node could not leave the process
+    alive-but-deaf. Every link in that chain is real and the conclusion is still
+    false: the callback deadlocks partway through `close()`, on the event loop
+    thread, long before it reaches the line that publishes. It was measured — a
+    yanked link, a node reboot, and an unprovoked read-thread death, and this
+    handler ran in none of the three.
+
+    The chain is written out in full at `_watch_for_ble_disconnect`, which
+    replaces that callback so it can no longer deadlock, and
+    `_supervise_ble_link` is what a BLE drop actually reaches. This method still
+    matters on BLE for one case: our own `close()`, which publishes on the way
+    out and is why `_stopping` is checked below.
     """
     # Our own close fires this event too — the reader thread exits identically
     # whether the device vanished or stop() dismissed it, and only this process
@@ -1081,6 +1613,15 @@ class MeshtasticCollector:
     # has the shutdown in hand, and setting _connection_lost here would turn a
     # clean exit into the nonzero one that exists for unplugs.
     if self._stopping:
+      return
+
+    # A retry that failed to connect publishes this from inside its own attempt:
+    # `BLEInterface.__init__` closes the half-built object on error
+    # (`ble_interface.py:74`), and BLE's close() publishes unconditionally. The
+    # loss it names has already been reported by `_supervise_ble_link` and is
+    # being acted on right now, so treating it as a new one would stop the
+    # recovery loop with the very event that recovery is responding to.
+    if self._reconnecting:
       return
 
     logging.error(

@@ -30,6 +30,14 @@ Type=simple
 #   BlueZ over DBus. Pair the node before the first run — this process cannot
 #   answer a PIN prompt.
 #
+#   Restart= below is still the reconnect policy for serial and TCP, and on BLE
+#   it is now the second line rather than the first: a dropped BLE link is
+#   reopened in-process up to BLE_RECONNECT_ATTEMPTS times before the collector
+#   gives up and exits nonzero for systemd to catch. Nothing here needs changing
+#   for that — the exit is the same exit — but it does mean a BLE unit that is
+#   restarting in a loop has already spent its in-process retries, so the radio
+#   is properly gone rather than briefly out of range.
+#
 
 User=YOURUSERNAME
 Group=YOURGROUP

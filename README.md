@@ -108,11 +108,27 @@ Set `CONNECTION_MODE` to `ble` and `BLE_ADDRESS` to the node's address or its ad
 
 Pair the host with the node before the first run. The collector cannot answer a PIN prompt, and an unpaired node fails with the library's own message about the `bluetooth` group and the PIN — which on Linux is also the hint worth taking literally: the user running the collector needs to be in `bluetooth` and able to reach BlueZ over DBus.
 
-Unlike serial and TCP, BLE is not exclusive — a node serves BLE while a USB cable is attached and busy. That is what makes it the easy one to try first.
+**A node serves serial or BLE, not both.** While something holds the USB serial port, the node stops advertising over Bluetooth entirely — a scan finds nothing, and it reappears within seconds of the serial client letting go. No power cycle is needed. So BLE mode is for a node no cable is attached to, which is what it was always for; pointing a BLE collector at a node that a serial collector is already archiving from does not give you two readers, it gives you one reader and one scan that finds nothing.
+
+#### When a BLE link drops
+
+BLE drops and comes back — someone carries the node out of range, the firmware reboots, the host's Bluetooth cycles — and unlike the other two transports the library neither reports it nor recovers from it. `BLEInterface` has no reconnect at all, and a dropped link publishes no event, so a collector left to itself sits there alive and archiving nothing.
+
+So on BLE the collector supervises the link itself, and it watches three ways at once. First and strongest is a disconnect callback of our own, put in place of the library's: the host's Bluetooth stack says the peripheral is gone and we hear it directly. That one is worth understanding, because it is not only the detector — the callback it displaces is what wedges the library on a dropped link, so installing ours is half the cure as well. On hardware it has caught every drop so far, within a millisecond of the radio going.
+
+Behind it, once a second, is a plain read of whether the host still considers the peripheral connected. It asks nothing of the library and waits on nothing, so it answers even when the rest of the interface will not, and it is what still notices a drop if the callback ever fails to install against some future version of bleak. Third is the library's own read thread: if it has died, the link died under it. Whichever signal speaks first, the collector says so in the journal, throws the dead interface away and opens a new one. `BLE_RECONNECT_ATTEMPTS` (default 5) caps how many times, and `BLE_RECONNECT_BACKOFF` (default 5 seconds) is the first gap, doubling up to a minute. The first attempt is immediate.
+
+Anything the collector cannot read, it treats as healthy. A library that has changed shape underneath us reads as a missing attribute, and a supervisor that tears down a working link because it could not find a field is worse than one that misses a drop the other two signals catch a moment later.
+
+Running out of attempts exits nonzero, which is what serial and TCP do on the first drop — the retry loop is in front of that behaviour, not instead of it. A radio that is genuinely gone still becomes the service manager's problem rather than a process that looks healthy forever. Setting `BLE_RECONNECT_ATTEMPTS` to `0` gives BLE the same one-drop-one-exit policy the other transports have.
+
+**Recovery is not continuity.** Packets that arrived while the link was down are gone; nothing replays LoRa. What recovery buys is that archiving resumes in seconds without a restart, and that the gap is one line in the journal instead of a silence you find days later.
 
 #### Watching for a link that goes quiet
 
 `LIVENESS_TIMEOUT` is off (`0`) by default and can stay that way for serial, where a disconnect is noticed immediately. It is there for TCP over a network that can disappear without closing the socket: after that many seconds of hearing nothing at all, the collector sends a heartbeat, and a failure exits so the service manager restarts it. The library eventually notices such a link on its own — this only makes it prompt.
+
+It is not BLE's drop detector and does not need to be switched on for BLE — the supervision above is always on, costs nothing, and cannot mistake a quiet mesh for a dead link the way a silence timer can. On BLE a failed probe feeds the reconnect above rather than exiting.
 
 All config options are documented in [`config.py`](/mesh_collector/config.py).
 

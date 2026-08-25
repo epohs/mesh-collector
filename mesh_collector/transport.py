@@ -63,12 +63,33 @@ class TransportSpec(NamedTuple):
   classes accept their connection detail by keyword (`devPath`, `hostname` +
   `portNumber`, `address`), so the caller never has to remember which is
   positional.
+
+  `reconnect_attempts` and `reconnect_backoff` are **where the reconnect policy
+  stops being uniform across transports**, and they are here rather than read
+  from `Config` at the call site so that the difference is a resolved value one
+  can print, not a branch buried in the recovery path.
+
+  Zero attempts means the original policy: any drop exits nonzero and the service
+  manager reconnects by restarting. That is what serial and TCP still get, and it
+  is right for them — pyserial reports a vanished device immediately, TCPInterface
+  heals its own blips, and on both a restart is cheap and rare.
+
+  BLE defaults to a non-zero count because none of that holds there. `BLEInterface`
+  has no reconnect of its own, a dropped link is not reported by the library at
+  all, and a restart re-runs channel sync, the initial node sync and the firmware
+  read — most of what the process does — for a radio that is very often back
+  within seconds. The count is a *cap*, not a promise: recovery that runs out of
+  attempts falls through to the same nonzero exit, so a genuinely dead radio still
+  becomes the service manager's problem rather than a process that looks healthy
+  forever.
   """
 
   mode: str
   label: str
   kwargs: dict[str, Any]
   liveness_timeout: int
+  reconnect_attempts: int
+  reconnect_backoff: int
 
 
 
@@ -101,7 +122,7 @@ def resolve(settings: Mapping[str, Any]) -> TransportSpec:
     port = str(settings.get("SERIAL_PORT", "")).strip()
     if not port:
       raise TransportError("CONNECTION_MODE=serial needs SERIAL_PORT set to a device path")
-    return TransportSpec(SERIAL, port, {"devPath": port}, liveness_timeout)
+    return TransportSpec(SERIAL, port, {"devPath": port}, liveness_timeout, 0, 0)
 
   if mode == TCP:
     host = str(settings.get("TCP_HOST", "")).strip()
@@ -115,6 +136,8 @@ def resolve(settings: Mapping[str, Any]) -> TransportSpec:
       f"tcp://{host}:{port_number}",
       {"hostname": host, "portNumber": port_number},
       liveness_timeout,
+      0,
+      0,
     )
 
   # BLE. The address is required: BLEInterface(None) is legal and means "probe
@@ -127,7 +150,24 @@ def resolve(settings: Mapping[str, Any]) -> TransportSpec:
       "CONNECTION_MODE=ble needs BLE_ADDRESS set to a MAC address or advertised "
       "name; run `meshtastic --ble-scan` to find it"
     )
-  return TransportSpec(BLE, f"ble://{address}", {"address": address}, liveness_timeout)
+  # 0 attempts is a supported answer and means "behave like serial and TCP" — one
+  # drop, one nonzero exit. It is not the default because on BLE that trades a
+  # two-second reconnect for a full restart, but an operator who would rather have
+  # the uniform policy back can have it without editing code.
+  attempts = _positive_int(
+    settings.get("BLE_RECONNECT_ATTEMPTS", 0), "BLE_RECONNECT_ATTEMPTS"
+  )
+  backoff = _positive_int(
+    settings.get("BLE_RECONNECT_BACKOFF", 0), "BLE_RECONNECT_BACKOFF"
+  )
+  return TransportSpec(
+    BLE,
+    f"ble://{address}",
+    {"address": address},
+    liveness_timeout,
+    attempts,
+    backoff,
+  )
 
 
 
