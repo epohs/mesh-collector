@@ -133,14 +133,127 @@ _TEXT_PREVIEW = 48
 
 
 
-def _format_uptime(seconds: int) -> str:
+# The default channel key, which is public — it ships in the firmware and every
+# radio on the default channel holds it. Needed here because a channel whose psk
+# is a single byte is not carrying a key at all; it is carrying an *index* into
+# this one. See `channel_hash`.
+DEFAULT_PSK = bytes.fromhex("d4f1bb3a20290759f0bcffabcf4e6901")
+
+
+def format_duration(seconds: int, compact: bool = False) -> str:
   """Seconds as the largest unit that stays readable — 15948976 is not a number
-  anyone reads as 184 days."""
+  anyone reads as 184 days, and 900 is not a number anyone reads as a quarter of
+  an hour.
+
+  Two callers with two registers, one implementation, because a project with two
+  duration formatters gets a third. `compact` is for a value sitting inside a
+  dense line of other values — `up 184d` in a telemetry readout, where the space
+  is worth more than the word. Without it the unit is spelled the way a sentence
+  would spell it, which is what the RX summary's window needs.
+
+  Below ninety seconds the answer is seconds. That case is new: the old uptime
+  formatter divided into minutes unconditionally and rendered a radio that had
+  been up for forty-five seconds as `0m`.
+  """
+  if seconds < 90:
+    return f"{seconds}s"
+
+  if compact:
+    if seconds < 3600:
+      return f"{seconds // 60}m"
+    if seconds < 86400:
+      return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+  # Rounded rather than floored, and that is the point of the whole helper: the
+  # RX summary reports the window it actually measured, which is 900 seconds only
+  # when the timing was exact. A 950-second window floored to minutes reads
+  # `15 min` — the same string an exact window produces — and a reader comparing
+  # two lines would have no way to see that one covered nearly a minute more.
   if seconds < 3600:
-    return f"{seconds // 60}m"
+    return f"{round(seconds / 60)} min"
   if seconds < 86400:
-    return f"{seconds // 3600}h"
+    # The odd minutes are kept rather than rounded away, because an hour is long
+    # enough that rounding to it loses a real amount of time — `1h` for anything
+    # between fifty and seventy minutes is the same complaint as `15 min` for a
+    # 950-second window, one unit up.
+    hours, minutes = divmod(round(seconds / 60), 60)
+    return f"{hours}h {minutes}m" if minutes else f"{hours}h"
   return f"{seconds // 86400}d"
+
+
+def portnum_label(portnum: str) -> str:
+  """`STORE_FORWARD_APP` as `store-forward`.
+
+  The `_APP` is on every one of them and so distinguishes nothing, the shouting
+  is protobuf's enum convention rather than anything about the packet, and the
+  underscore inside the name is a word boundary that a hyphen renders more
+  honestly. What is left is the word a person would have used.
+
+  Only for lines this project writes. The portnum inside a dumped protobuf keeps
+  the library's spelling, because that record is a transcript of what the library
+  said and rewriting fields inside it would make it a worse transcript.
+  """
+  return portnum.removesuffix("_APP").lower().replace("_", "-")
+
+
+def channel_hash(name: str, psk: Optional[bytes]) -> Optional[int]:
+  """The one-byte channel hash a radio puts in the header of a packet it sends
+  on this channel, or None when it cannot be computed.
+
+  This is the firmware's `Channels::generateHash` (channels.cpp), reimplemented
+  rather than imported because the python library does not expose it: XOR every
+  byte of the key, then XOR every byte of the name. That is the whole algorithm,
+  and it is why two different channels can land on the same hash.
+
+  **The point of having it is one comparison.** An undecryptable packet carries
+  this hash and nothing else identifying, so the only question a reader can ask
+  of it is whether it belongs to a channel this radio is configured for. "Yes"
+  means a PSK has drifted on one side and there is something to fix; "no" means a
+  neighbour is talking on a channel we were never given, and there is nothing to
+  do. The two look identical without this function, which is why the log used to
+  print the raw hex and leave the reader to it.
+
+  A single-byte psk is not a key: it is an index into the default one, which is
+  what `DEFAULT_PSK` is here for. Index 0 means no encryption at all, which the
+  firmware treats as a zero-length key rather than as a missing one — the name
+  still hashes. Anything else is the key as given.
+
+  None is returned when there is no psk to work from, and the caller must not
+  guess past it: claiming a hash we did not compute would put the wrong channel's
+  name on somebody's key-mismatch alarm.
+  """
+  if psk is None:
+    return None
+
+  if len(psk) == 1:
+    index = psk[0]
+    if index == 0:
+      key = b""
+    else:
+      # The firmware walks the default key forward by the index, one byte, in
+      # place. Index 1 *is* the default key; 2 is the default key plus one.
+      key = DEFAULT_PSK[:15] + bytes([(DEFAULT_PSK[15] + index - 1) & 0xFF])
+  else:
+    key = psk
+
+  code = 0
+  for byte in key:
+    code ^= byte
+  for byte in name.encode("utf-8"):
+    code ^= byte
+
+  return code
+
+
+def _format_uptime(seconds: int) -> str:
+  """Uptime for a telemetry readout: `format_duration` in its compact register.
+
+  Kept as a name of its own because that is what the telemetry code calls it and
+  what it means there — the indirection is one line and the alternative is a
+  second implementation of the same arithmetic.
+  """
+  return format_duration(seconds, compact=True)
 
 
 

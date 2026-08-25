@@ -15,7 +15,7 @@ import urllib.request
 from typing import TYPE_CHECKING, Optional
 
 from meshtastic.mesh_interface import MeshInterface
-from meshtastic.protobuf import mesh_pb2, portnums_pb2
+from meshtastic.protobuf import config_pb2, mesh_pb2, portnums_pb2
 from meshtastic.serial_interface import SerialInterface
 from pubsub import pub
 
@@ -59,6 +59,29 @@ CONTROL_POLL_INTERVAL = 1.0
 # watching.
 RX_SUMMARY_INTERVAL = 900
 RX_SUMMARY_MAX_DROPS = 50
+
+# **What the firmware calls a channel that has no name of its own.** An unnamed
+# primary channel is not hashed under an empty string: `Channels::getName`
+# substitutes the modem preset's name, so the default channel everybody shares
+# hashes as "LongFast" and comes out 0x08. Without this table a radio running an
+# unnamed primary could never be matched against its own packets, which is the
+# one case `channel_hash` exists to catch.
+#
+# Keyed by the protobuf enum name rather than its number: the numbers are wire
+# format and stable, but reading `LONG_FAST` beside `LongFast` is what makes a
+# missing entry obvious when the firmware adds a preset. An unknown preset is a
+# miss, not a guess — see `_channel_hash_name`.
+_PRESET_NAMES = {
+  "SHORT_TURBO": "ShortTurbo",
+  "SHORT_FAST": "ShortFast",
+  "SHORT_SLOW": "ShortSlow",
+  "MEDIUM_FAST": "MediumFast",
+  "MEDIUM_SLOW": "MediumSlow",
+  "LONG_FAST": "LongFast",
+  "LONG_MODERATE": "LongMod",
+  "LONG_SLOW": "LongSlow",
+  "VERY_LONG_SLOW": "VLongSlow",
+}
 
 # How long the liveness probe waits for the radio to answer before calling the
 # link gone.
@@ -223,6 +246,33 @@ def _identity_label(row: dict) -> str:
 
 
 
+def _node_label(node_id: str, row: Optional[dict]) -> str:
+  """A node for a log line: its name and its id, or just its id.
+
+  `!eb179ad7` is not a name, and a log full of them is a log you read with the
+  node list open in another window. The name is nearly always already in hand
+  where these lines are written — the receive path reads the row before it
+  decides anything else — so this costs a dict lookup rather than a query.
+
+  **The id stays.** It is what the archive is keyed by, what a grep for one node
+  matches on, and what the console paints its own colour; dropping it to save
+  eleven columns would break all three. And an unnamed node keeps the bare id
+  rather than gaining the word "unnamed", which is `_identity_label`'s answer and
+  the right one where the subject is the identity itself — here it would be a
+  label reading `unnamed !eb179ad7`, which says nothing the id did not.
+
+  Untidy logs get the id alone, unchanged, like every other formatting this
+  module does under TIDY_LOGS.
+  """
+  if not logfmt.tidy_logs() or not row:
+    return node_id
+
+  name = row.get("long_name") or row.get("short_name")
+  return f"{name} {node_id}" if name else node_id
+
+
+
+
 def _is_fabricated_identity(node_id: str, user: dict) -> bool:
   """True when a cached `user` is meshtastic's invention rather than something
   a node broadcast.
@@ -300,6 +350,20 @@ class MeshtasticCollector:
     # quotes it in hex rather than pretending to name a channel.
     self._undecryptable_counts: dict[int, int] = {}
     self._undecryptable_mqtt = 0
+    # Channel index to the name the device gave it, for every channel the device
+    # knows rather than only the tracked ones: a non-text packet can arrive on a
+    # channel this collector does not archive, and the summary still has to name
+    # it. Filled by _sync_channels, which is the only place that has read the
+    # device's channel list. Empty until then, and _channel_label falls back to
+    # the index, so a log line written before the sync is unlabelled rather than
+    # wrong.
+    self.channel_names: dict[int, str] = {}
+    # The reverse of the problem above: channel **hash** to the name of the
+    # configured channel that hashes to it. An undecryptable packet carries only
+    # the hash, and the single question worth asking of it is whether it belongs
+    # to a channel this radio is supposed to be able to read. A hit here is a key
+    # mismatch and something to fix; a miss is a neighbour and nothing to do.
+    self.channel_hashes: dict[int, str] = {}
     # Channel hashes already reported once, so the explanatory line fires on
     # first sighting and not forty times a minute afterwards. Never cleared by
     # the summary reset — first sighting means first this process, not first
@@ -1753,7 +1817,7 @@ class MeshtasticCollector:
       # Those two fall through as ordinary traffic: the node row updates,
       # the payload is not archived (a home for it would be a schema
       # decision, not taken here).
-      self._handle_text_message(packet, from_node_id)
+      self._handle_text_message(packet, from_node_id, existing)
       # No return: a message is also evidence the sender is alive, so its
       # receive metrics land on the node row below like any other packet.
     else:
@@ -1842,7 +1906,11 @@ class MeshtasticCollector:
 
 
   def _maybe_log_rx_summary(self) -> None:
-    """Account for what the receive path dropped, once a window, on one line.
+    """Account for what the receive path did not archive, once a window.
+
+    One line with TIDY_LOGS off, which is the shape a grep expects and is left
+    exactly as it was; two with it on, split by what a reader would do about
+    them — see `_log_rx_summary_tidy`.
 
     Called from the receive path rather than from a timer, so it runs on the
     same thread that owns the counters and needs no lock. The cost is that a
@@ -1868,40 +1936,159 @@ class MeshtasticCollector:
     if window < RX_SUMMARY_INTERVAL and total_drops < RX_SUMMARY_MAX_DROPS:
       return
 
-    clauses = []
+    if logfmt.tidy_logs():
+      self._log_rx_summary_tidy(round(window))
+    else:
+      clauses = []
 
-    if self._undecryptable_counts:
-      # Sorted by count, worst first: with several hashes in play the one being
-      # shouted at is the one worth reading, and it should not depend on which
-      # hash happens to sort lower.
-      parts = ", ".join(
-        f"ch-hash 0x{channel_hash:02x} x{count}"
-        for channel_hash, count in sorted(
-          self._undecryptable_counts.items(), key=lambda item: -item[1]
+      if self._undecryptable_counts:
+        # Sorted by count, worst first: with several hashes in play the one being
+        # shouted at is the one worth reading, and it should not depend on which
+        # hash happens to sort lower.
+        parts = ", ".join(
+          f"ch-hash 0x{channel_hash:02x} x{count}"
+          for channel_hash, count in sorted(
+            self._undecryptable_counts.items(), key=lambda item: -item[1]
+          )
         )
-      )
-      mqtt = f" ({self._undecryptable_mqtt} mqtt)" if self._undecryptable_mqtt else ""
-      clauses.append(f"undecryptable {parts}{mqtt}")
+        mqtt = f" ({self._undecryptable_mqtt} mqtt)" if self._undecryptable_mqtt else ""
+        clauses.append(f"undecryptable {parts}{mqtt}")
 
-    if self._nontext_counts:
-      parts = ", ".join(
-        f"ch{channel_index} {portnum} x{count}"
-        for (channel_index, portnum), count in sorted(
-          self._nontext_counts.items(), key=lambda item: -item[1]
+      if self._nontext_counts:
+        parts = ", ".join(
+          f"ch{channel_index} {portnum} x{count}"
+          for (channel_index, portnum), count in sorted(
+            self._nontext_counts.items(), key=lambda item: -item[1]
+          )
         )
-      )
-      clauses.append(f"non-text {parts}")
+        clauses.append(f"non-text {parts}")
 
-    # One line, no newlines, no quoted fields — deliberately, so
-    # logfmt.TidyLogFilter passes it through untouched (it rewrites multi-line
-    # records and records carrying `field: "..."` byte fields) and so
-    # `grep 'RX summary'` over a day of journal returns one row per window.
-    logging.info("RX summary (last %ds): %s", round(window), "; ".join(clauses))
+      # One line, no newlines, no quoted fields — deliberately, so
+      # logfmt.TidyLogFilter passes it through untouched (it rewrites multi-line
+      # records and records carrying `field: "..."` byte fields) and so
+      # `grep 'RX summary'` over a day of journal returns one row per window.
+      logging.info("RX summary (last %ds): %s", round(window), "; ".join(clauses))
 
     self._undecryptable_counts.clear()
     self._undecryptable_mqtt = 0
     self._nontext_counts.clear()
     self._rx_summary_at = now
+
+
+
+
+  def _log_rx_summary_tidy(self, window: int) -> None:
+    """The same window as two lines a person can read at a glance.
+
+    **Split because the two halves are different news.** The first line is what
+    was lost — packets this radio could not read at all, which is the half with
+    something to act on. The second is a ledger of what was heard, understood,
+    and not archived, which is the half that explains a channel looking silent.
+    Run together, as they were, the reader has to disentangle a wrong key from an
+    ordinary quiet channel inside one two-hundred-character line, and the heading
+    said "RX summary" — which reads as *all* traffic and is exactly what it is
+    not. Nothing here is a count of what was stored.
+
+    Counts first, itemisation second, so the "how much" is legible without
+    reading the "of what". The second line is skipped entirely when there is no
+    non-text traffic, which makes its presence mean something.
+    """
+    span = logfmt.format_duration(window)
+    head = []
+
+    if self._undecryptable_counts:
+      total = sum(self._undecryptable_counts.values())
+      packets = "packet" if total == 1 else "packets"
+
+      # Split by the one question the hash can answer. `ours` is a channel this
+      # radio is configured for, whose packets it nonetheless could not read —
+      # a PSK that has drifted on one side, and the only case in this whole line
+      # with a fix. `theirs` is a neighbour on a channel we were never given.
+      ours, theirs = {}, {}
+      for value, count in self._undecryptable_counts.items():
+        name = self.channel_hashes.get(value)
+        if name:
+          ours[name] = ours.get(name, 0) + count
+        else:
+          theirs[value] = count
+
+      if ours:
+        # The hex is printed here and nowhere else, because here it is evidence
+        # rather than decoration: it is what a reader would compare against the
+        # `Channel hashes:` line from startup to check this claim.
+        named = "; ".join(
+          f"{count} on {name}, whose key does not match this radio's "
+          f"(0x{self._hash_for(name):02x})"
+          for name, count in sorted(ours.items(), key=lambda item: -item[1])
+        )
+        rest = ""
+        if theirs:
+          count = sum(theirs.values())
+          channels = "channel" if len(theirs) == 1 else "channels"
+          rest = f"; {count} on {len(theirs)} unknown {channels}"
+        head.append(f"{total} {packets} with no key — {named}{rest}")
+      else:
+        # No hex at all in the ordinary case. Three hashes is three separate
+        # channels nearby that this radio has no key for, which is the whole of
+        # what the numbers were telling anyone, and the count says it in words.
+        channels = "channel" if len(theirs) == 1 else "channels"
+        head.append(f"{total} {packets} on {len(theirs)} {channels} with no key")
+
+      if self._undecryptable_mqtt:
+        head[-1] += f" ({self._undecryptable_mqtt} via mqtt)"
+
+    if self._nontext_counts:
+      total = sum(self._nontext_counts.values())
+      packets = "packet" if total == 1 else "packets"
+      indexes = {index for index, _ in self._nontext_counts}
+      channels = "channel" if len(indexes) == 1 else "channels"
+      # "tracked" is only said when it is true of all of them. The counter takes
+      # any decrypted non-text packet, including one on a channel this collector
+      # does not archive — normally there is no such channel and the word is
+      # simply accurate, but it is the kind of word that would go on being
+      # printed long after it stopped being.
+      scope = "tracked " if indexes <= set(self.tracked_channels) else ""
+      head.append(f"{total} non-text {packets} on {len(indexes)} {scope}{channels}")
+
+    logging.info("Not archived, last %s: %s", span, "; ".join(head))
+
+    if not self._nontext_counts:
+      return
+
+    # Grouped by channel, busiest channel first, busiest portnum first within it.
+    # The old line repeated `ch0` once per portnum — four times in a normal
+    # window — which is four times the reader has to check whether the number
+    # changed.
+    by_channel: dict[int, list[tuple[str, int]]] = {}
+    for (index, portnum), count in self._nontext_counts.items():
+      by_channel.setdefault(index, []).append((portnum, count))
+
+    groups = []
+    for index, items in sorted(
+      by_channel.items(), key=lambda item: -sum(count for _, count in item[1])
+    ):
+      parts = ", ".join(
+        f"{logfmt.portnum_label(portnum)} x{count}"
+        for portnum, count in sorted(items, key=lambda item: -item[1])
+      )
+      groups.append(f"{self._channel_label(index)} {parts}")
+
+    logging.info("Payloads not stored: %s", "; ".join(groups))
+
+
+
+
+  def _hash_for(self, channel_name: str) -> int:
+    """The hash a named channel was registered under, for printing beside it.
+
+    A reverse lookup rather than a second map: `channel_hashes` is small, this
+    runs once a quarter of an hour at most, and the alternative is two structures
+    that can disagree about which channel owns a hash.
+    """
+    for value, name in self.channel_hashes.items():
+      if name == channel_name:
+        return value
+    return 0
 
 
 
@@ -2179,7 +2366,11 @@ class MeshtasticCollector:
             "Self %s held for the tidy log: %s", node_id, logfmt.format_changes(changed)
           )
       else:
-        logging.info("Node %s updated: %s", node_id, logfmt.format_changes(changed))
+        logging.info(
+          "Node %s updated: %s",
+          _node_label(node_id, merged),
+          logfmt.format_changes(changed),
+        )
     else:
       logging.debug("Skip: %s (no changes)", node_id)
 
@@ -2232,8 +2423,16 @@ class MeshtasticCollector:
 
 
 
-  def _handle_text_message(self, packet: dict, from_node_id: str) -> None:
-    """Route TEXT_MESSAGE_APP packets to channel or DM storage."""
+  def _handle_text_message(
+    self, packet: dict, from_node_id: str, existing: Optional[dict] = None
+  ) -> None:
+    """Route TEXT_MESSAGE_APP packets to channel or DM storage.
+
+    `existing` is the sender's node row as `_handle_receive` already read it, and
+    is here only so the log lines below can print a name without going back to
+    the database for one. Optional because nothing else about this function needs
+    it, and a caller that hasn't got one is not wrong.
+    """
     decoded = packet.get("decoded", {})
     text = decoded.get("text", "")
 
@@ -2245,7 +2444,7 @@ class MeshtasticCollector:
     )
 
     if not text:
-      logging.debug("Skip: empty text message from %s", from_node_id)
+      logging.debug("Not archived: an empty text message from %s", from_node_id)
       return
 
     to_id = packet.get("toId")
@@ -2312,6 +2511,16 @@ class MeshtasticCollector:
 
     metrics = logfmt.metrics_suffix(snr, rssi, hop_count)
 
+    # The row was read on the way in, *before* the seed that may have created it,
+    # so the first message from a newly discovered node arrives here with None —
+    # exactly the message where a name is worth most. Re-read once in that case:
+    # a text message is the rarest thing this collector handles and one indexed
+    # lookup against it is nothing, where the same read on the packet path would
+    # not have been.
+    if existing is None and logfmt.tidy_logs():
+      existing = self.storage.get_node(from_node_id)
+    sender = _node_label(from_node_id, existing)
+
     if is_dm:
       if not Config.get("STORE_DIRECT_MESSAGES"):
         # Worth an INFO line — a DM arriving is mesh traffic whether or not this
@@ -2319,7 +2528,7 @@ class MeshtasticCollector:
         # MESSAGES being off is a decision not to retain DM content, and writing
         # it to the log would retain it anyway, just somewhere else.
         logging.info(
-          "DM  %s: (not stored; STORE_DIRECT_MESSAGES is off)%s", from_node_id, metrics
+          "DM  %s: (not stored; STORE_DIRECT_MESSAGES is off)%s", sender, metrics
         )
         return
 
@@ -2341,14 +2550,17 @@ class MeshtasticCollector:
           emoji=emoji,
         )
         if inserted:
-          logging.info("DM  %s: %s%s", from_node_id, text[:100], metrics)
+          logging.info("DM  %s: %s%s", sender, text[:100], metrics)
         else:
           logging.debug("Duplicate DM skipped: message_id=%s", message_id)
       except Exception:
         logging.exception("Failed to insert DM from %s", from_node_id)
     else:
       if not self._should_log_channel(channel_index):
-        logging.debug("Skip: message on untracked channel %d", channel_index)
+        logging.debug(
+          "Not archived: a message on %s, which this collector does not track",
+          self._channel_label(channel_index),
+        )
         return
 
       try:
@@ -2367,7 +2579,10 @@ class MeshtasticCollector:
           emoji=emoji,
         )
         if inserted:
-          logging.info("CH%d %s: %s%s", channel_index, from_node_id, text[:100], metrics)
+          logging.info(
+            "%s %s: %s%s",
+            self._channel_label(channel_index), sender, text[:100], metrics,
+          )
         else:
           logging.debug("Duplicate message skipped: message_id=%s", message_id)
       except Exception:
@@ -2424,6 +2639,141 @@ class MeshtasticCollector:
     tracked.update(int(idx) for idx in Config.get("LOG_CHANNEL_IDS") or [])
 
     return sorted(tracked)
+
+
+
+
+  def _channel_label(self, channel_index: int) -> str:
+    """A channel for a log line — its name, or `ch3` when there isn't one.
+
+    `ch0` is a number out of a protobuf and `NCMesh` is the thing the reader
+    named; between two channels the number cannot tell you which one has gone
+    quiet. Falls back to the index whenever the map has no answer — before the
+    sync has run, or for a channel the device did not report — because an index
+    is at least true, and untidy logs keep the index in every case.
+    """
+    if not logfmt.tidy_logs():
+      return f"ch{channel_index}"
+
+    return self.channel_names.get(channel_index) or f"ch{channel_index}"
+
+
+
+
+  def _channel_hash_name(self, channel, index: int, primary_channel: int) -> Optional[str]:
+    """The name the *firmware* hashes this channel under, or None.
+
+    Not the same string as the display name and deliberately derived apart from
+    it. A channel with no name of its own hashes under the modem preset's name
+    (see `_PRESET_NAMES`), while the same channel *displays* as "Primary" — hash
+    it under the word this project made up for the log and every comparison it
+    feeds is wrong.
+
+    None means "cannot be computed", and that is a real answer: an unknown modem
+    preset, or a firmware that stops reporting one. The caller must drop the
+    channel rather than fall back, because the whole value of the hash map is
+    that a hit in it is trustworthy.
+    """
+    settings = getattr(channel, "settings", None)
+    raw_name = (getattr(settings, "name", "") or "").strip() if settings else ""
+    if raw_name:
+      return raw_name
+
+    if index != primary_channel:
+      # A secondary channel with no name is hashed under the empty string by the
+      # firmware, which is a legal channel and a computable hash.
+      return ""
+
+    local_config = getattr(self.interface, "localConfig", None)
+    if local_config is None:
+      return None
+
+    try:
+      preset = config_pb2.Config.LoRaConfig.ModemPreset.Name(
+        local_config.lora.modem_preset
+      )
+    except Exception:
+      # A preset number this build of the protobuf has no name for. Same answer
+      # as an unknown preset name below: no hash rather than a guessed one.
+      return None
+
+    return _PRESET_NAMES.get(preset)
+
+
+
+
+  def _build_channel_labels(self, device_channels: dict, primary_channel: int) -> None:
+    """Fill `channel_names` and `channel_hashes` from the device's channel list.
+
+    Wrapped in its own try per channel for the same reason `_sync_channels` is:
+    one channel the library hands back in an unexpected shape should cost that
+    channel its label, not cost every channel after it theirs. A missing label is
+    a log line that falls back to `ch2`; an exception here would be a collector
+    that will not start over the spelling of a log line.
+    """
+    self.channel_names = {}
+    self.channel_hashes = {}
+
+    for index, channel in sorted(device_channels.items()):
+      try:
+        # A disabled channel carries no traffic and must not be able to claim a
+        # hash: its name and key are still in the config, so leaving it in the
+        # map would let a neighbour's packet be reported as our own key drifting.
+        if getattr(channel, "role", 1) == 0:
+          continue
+
+        settings = getattr(channel, "settings", None)
+        raw_name = (getattr(settings, "name", "") or "").strip() if settings else ""
+
+        if raw_name:
+          self.channel_names[index] = raw_name
+        elif index == primary_channel:
+          # The same fallback the tracked loop below writes to the archive, so a
+          # log line and a reader's channel list say the same word.
+          self.channel_names[index] = "Primary"
+        else:
+          self.channel_names[index] = f"Channel {index}"
+
+        hash_name = self._channel_hash_name(channel, index, primary_channel)
+        if hash_name is None:
+          continue
+
+        psk = getattr(settings, "psk", None) if settings else None
+        computed = logfmt.channel_hash(hash_name, psk)
+        if computed is None:
+          continue
+
+        # First writer wins. Two channels really can hash the same, and a
+        # collision means neither name is a safe thing to print beside a packet —
+        # but reporting the wrong one of our own channels is a far smaller wrong
+        # than reporting a stranger's packet as our own key failing, so the
+        # collision keeps a name and the log says which channels share it.
+        if computed in self.channel_hashes:
+          logging.warning(
+            "Channels %s and %s both hash to 0x%02x; an undecryptable packet "
+            "with that hash cannot be attributed to either",
+            self.channel_hashes[computed], self.channel_names[index], computed,
+          )
+          continue
+
+        self.channel_hashes[computed] = self.channel_names[index]
+
+      except Exception:
+        logging.exception("Could not label channel %s for the log", index)
+
+    if self.channel_hashes:
+      # Printed once at startup because it is the key the RX summary is read
+      # against, and because it is the only evidence that the hash computation
+      # agrees with the radio at all: a hash here that never appears in a
+      # summary is the healthy case, and one that appears constantly is a PSK
+      # that has drifted. The hashes are not secret — every packet broadcasts
+      # its own in the clear.
+      logging.info(
+        "Channel hashes: %s",
+        ", ".join(
+          f"0x{value:02x} {name}" for value, name in sorted(self.channel_hashes.items())
+        ),
+      )
 
 
 
@@ -2497,6 +2847,14 @@ class MeshtasticCollector:
       )
       return False
 
+    # **Every channel the device knows gets a name and a hash, tracked or not.**
+    # The loop below only walks the tracked ones, because only those get a row in
+    # `channels` — but a non-text packet can arrive on any of them, and the RX
+    # summary has to be able to say which. Built before that loop so a per-channel
+    # write failure below cannot cost the labels; nothing here touches the
+    # archive, so nothing here can fail in a way worth aborting a sync for.
+    self._build_channel_labels(device_channels, primary_channel)
+
     # The per-channel try covers the name derivation as well as the write. A
     # channel object the library hands back in an unexpected shape raises in the
     # getattr walk, not in sqlite, and wrapping only the write would let that one
@@ -2555,7 +2913,14 @@ class MeshtasticCollector:
         landed + failed,
       )
     else:
-      logging.info("Channels synced successfully")
+      # Names rather than "successfully", because the names are the fact worth
+      # having: this is the line a reader checks when a channel's messages are
+      # missing from a reader, and "successfully" answers a question nobody
+      # asked. The `Self` line and the RX summary both use these same words.
+      logging.info(
+        "Archiving messages on %s",
+        ", ".join(self._channel_label(index) for index in tracked),
+      )
 
     return True
 
