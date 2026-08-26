@@ -761,9 +761,27 @@ def metrics_suffix(snr, rssi, hop_count) -> str:
 
 
 
+# Fields whose value is a count of seconds. The change list prints whatever the
+# node row holds, and for these that is a number nobody reads: a router that has
+# been up for a year reports `uptime_seconds 31339446`, which is the same
+# unreadable quantity `format_duration` was written for one line up. Kept as a
+# set rather than special-cased inline because the second such field is coming
+# and should not be a second branch.
+_DURATION_FIELDS = {"uptime_seconds"}
+
+
 def format_changes(changed: dict) -> str:
   """Node field changes as `voltage 3.91, rssi -30` rather than a Python dict."""
   if not tidy_logs():
     return repr(changed)
 
-  return ", ".join(f"{key} {value}" for key, value in changed.items())
+  parts = []
+  for key, value in changed.items():
+    if key in _DURATION_FIELDS and isinstance(value, int):
+      # Compact: this sits in a line of other values, and `up 362d` is what the
+      # telemetry readout already calls the same number.
+      parts.append(f"{key} {format_duration(value, compact=True)}")
+    else:
+      parts.append(f"{key} {value}")
+
+  return ", ".join(parts)

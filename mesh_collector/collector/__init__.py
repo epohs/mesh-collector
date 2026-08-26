@@ -267,7 +267,11 @@ def _node_label(node_id: str, row: Optional[dict]) -> str:
   if not logfmt.tidy_logs() or not row:
     return node_id
 
-  name = row.get("long_name") or row.get("short_name")
+  # Stripped, because a node's own broadcast name is whatever its owner typed
+  # into it: `WNC Router Zero ` has a trailing space and produced a label with
+  # two spaces before the id. The archive keeps the name as it arrived; this is
+  # a log line and the space is not information.
+  name = (row.get("long_name") or row.get("short_name") or "").strip()
   return f"{name} {node_id}" if name else node_id
 
 
