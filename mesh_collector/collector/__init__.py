@@ -234,9 +234,14 @@ def _hops_taken(packet: dict) -> Optional[int]:
 def _identity_label(row: dict) -> str:
   """Render a node row's identity for the log — "Foo Bar (FOO)" when it has
   both names, whichever one it has when it has one, "unnamed" when it has
-  neither. Nameless is now an ordinary, expected state for a row."""
-  long_name = row.get("long_name")
-  short_name = row.get("short_name")
+  neither. Nameless is now an ordinary, expected state for a row.
+
+  Both names are stripped for the same reason `_node_label` strips one: they are
+  whatever the node's owner typed into the field, `WNC Router Zero ` ends in a
+  space, and this function is now read next to that one on the `New Node` and
+  `identified` lines where a stray space shows up as `Zero  (WNC )`."""
+  long_name = (row.get("long_name") or "").strip()
+  short_name = (row.get("short_name") or "").strip()
 
   if long_name and short_name:
     return f"{long_name} ({short_name})"
@@ -247,19 +252,41 @@ def _identity_label(row: dict) -> str:
 
 
 def _node_label(node_id: str, row: Optional[dict]) -> str:
-  """A node for a log line: its name and its id, or just its id.
+  """A node for a log line: its id, then its short name in brackets — `!ccc696cf (96cf)`.
 
   `!eb179ad7` is not a name, and a log full of them is a log you read with the
   node list open in another window. The name is nearly always already in hand
   where these lines are written — the receive path reads the row before it
   decides anything else — so this costs a dict lookup rather than a query.
 
-  **The id stays.** It is what the archive is keyed by, what a grep for one node
-  matches on, and what the console paints its own colour; dropping it to save
-  eleven columns would break all three. And an unnamed node keeps the bare id
-  rather than gaining the word "unnamed", which is `_identity_label`'s answer and
-  the right one where the subject is the identity itself — here it would be a
-  label reading `unnamed !eb179ad7`, which says nothing the id did not.
+  **The id stays, and now it leads.** It is what the archive is keyed by, what a
+  grep for one node matches on, and what the console paints its own colour. It
+  leads because a log is read down its columns rather than along its lines, the
+  same reason the level marker is padded to a fixed width in mesh-console's
+  `logfmt.align_fields`: `Node !ccc696cf updated:` puts every id of every
+  update on one column, where `Node Meshtastic 96cf !ccc696cf updated:` moved
+  that column by the width of whatever the node's owner typed into the name
+  field, and a screenful of those has no column to read down at all. Jason's,
+  2026-08-26.
+
+  **The short name, not the long one, and nothing at all when there is no short
+  name.** The bracket says which node this is in the word a reader recognises;
+  it is not the identity record. `_identity_label` is that, and `Node %s
+  identified:` is where both names get printed in full — a long name is as wide
+  as its owner felt like being, so carrying it here would hand back most of what
+  putting the id first just bought. An unnamed node keeps the bare id rather
+  than gaining an empty `()` or the word "unnamed", which says nothing the id
+  did not.
+
+  **A short name that is only the id again is dropped with the brackets.**
+  `!ccc696cf (96cf)` spends six columns restating four characters already on
+  screen, and it is not a coincidence: `Meshtastic 96cf` / `96cf` is the identity
+  meshtastic's own `_getOrCreateByNum` invents for a node it has met by number
+  alone — see `_is_fabricated_identity`, which matches the same formula where the
+  question is whether to archive it. So the brackets now mean something: a node
+  that has one has told us what it is called, and a bare id has not. A node whose
+  owner really did type its own hex suffix into the field loses nothing but a
+  repetition.
 
   Untidy logs get the id alone, unchanged, like every other formatting this
   module does under TIDY_LOGS.
@@ -268,11 +295,17 @@ def _node_label(node_id: str, row: Optional[dict]) -> str:
     return node_id
 
   # Stripped, because a node's own broadcast name is whatever its owner typed
-  # into it: `WNC Router Zero ` has a trailing space and produced a label with
-  # two spaces before the id. The archive keeps the name as it arrived; this is
-  # a log line and the space is not information.
-  name = (row.get("long_name") or row.get("short_name") or "").strip()
-  return f"{name} {node_id}" if name else node_id
+  # into it: `WNC Router Zero ` has a trailing space, and unstripped it reached
+  # the log as `(WNC )`. The archive keeps the name as it arrived; this is a log
+  # line and the space is not information.
+  short_name = (row.get("short_name") or "").strip()
+
+  # Case-folded on both sides: the id is written in lowercase hex here and a node
+  # is free to have shouted its suffix back in either case.
+  if short_name.lower() == node_id[-4:].lower():
+    return node_id
+
+  return f"{node_id} ({short_name})" if short_name else node_id
 
 
 
@@ -2314,13 +2347,20 @@ class MeshtasticCollector:
       return is_new_node
 
     if is_new_node:
-      # Where it was heard, and whether it arrived with a name. Node dicts out
+      # Whether it arrived with a name, and where it was heard. Node dicts out
       # of the device's own cache carry no portnum.
+      #
+      # **This line breaks the update lines' column on purpose.** `New Node` is
+      # four columns wider than `Node` — and than `Self`, which is why those two
+      # share one — so the id here sits four columns right of every
+      # `Node !hex updated:` above it. A node being discovered is a different
+      # kind of record from a node being re-read, worth the eye catching rather
+      # than worth hiding in the column. Jason's, 2026-08-26.
       logging.info(
-        "New node discovered: %s (%s, %s)",
+        "New Node %s found: %s, via %s",
         node_id,
-        portnum or "device cache",
         _identity_label(merged),
+        portnum or "device cache",
       )
       return True
 
