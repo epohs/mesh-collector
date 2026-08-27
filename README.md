@@ -130,6 +130,18 @@ Running out of attempts exits nonzero, which is what serial and TCP do on the fi
 
 It is not BLE's drop detector and does not need to be switched on for BLE — the supervision above is always on, costs nothing, and cannot mistake a quiet mesh for a dead link the way a silence timer can. On BLE a failed probe feeds the reconnect above rather than exiting.
 
+#### When the radio's clock is wrong
+
+Every timestamp in the archive is a Unix epoch integer, and the ones on arriving traffic come from `rxTime` — written by the receiving radio, off the radio's own clock. A Meshtastic node with no GPS and no client to set its clock has no way to know the time and no way to find out it is wrong, so that stamp is a claim rather than a fact, and it is worth checking against the one thing that can check it: a packet being handled right now.
+
+`RX_TIME_TOLERANCE` (default `900`, in seconds) is how far the radio's stamp may sit from this machine's clock before the collector stops believing it and stamps the arrival with its own clock instead. The window is sized for delay, not for drift — MQTT relay and the collector's own queue cost real seconds, and a healthy radio here measured 15 of them, against a fault that measured 32,870. Setting it to `0` disables the check and trusts the radio unconditionally, which is what this collector did before the check existed.
+
+A rejected stamp is reported, at WARNING, on transitions only: when the clock goes wrong, again if it changes how wrong it is, and once at INFO when it comes back. Every packet passes through the check, so a line per packet would bury the mesh traffic the log is for — and the recovery line is there because after fixing a clock the question is "did that work", which the log should answer without a query.
+
+**The collector cannot fix the radio, and does not pretend to.** Substituting a good stamp keeps the archive honest, but the radio stays wrong until something sets it: `meshtastic --set-time`, or a phone app connecting. That needs the port, so the collector has to stop first. Nothing in `meshtastic-python` sets a node's clock on connect, so a radio that comes up without the time will stay without it indefinitely.
+
+The check is on the packet path only. The initial sync replays the device's node cache, whose `lastHeard` values genuinely refer to the past; substituting the wall clock there would claim the radio just heard a node it last heard yesterday. Those are stored as the device reported them, and `nodes.last_seen` corrects itself on the next live packet.
+
 All config options are documented in [`config.py`](/mesh_collector/config.py).
 
 

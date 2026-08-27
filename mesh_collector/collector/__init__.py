@@ -231,6 +231,59 @@ def _hops_taken(packet: dict) -> Optional[int]:
 
 
 
+def _rx_time(packet: dict, now: int, tolerance: int) -> tuple[int, Optional[int]]:
+  """When this packet arrived, and by how much the radio's clock was wrong if we
+  had to answer that ourselves.
+
+  **The radio's stamp is a claim, and this is the one place it can be checked.**
+  `rxTime` is written by the receiving radio, and a Meshtastic node with no GPS
+  and no client to set its clock has no way to know the time and no way to find
+  out it is wrong. On 2026-08-25 this radio's clock fell 9h 8m behind and stayed
+  there; the archive stored every stamp it offered, both readers rendered them
+  faithfully, and every timestamp on every screen was nine hours in the past for
+  two days. Nothing in the chain was in a position to notice, because an epoch
+  integer carries no evidence about the clock that produced it.
+
+  A packet being handled *now* is the evidence. The collector reads it off the
+  link within a second or so of the radio hearing it, so the two clocks are
+  describing the same moment and any real disagreement between them is the
+  radio's error. `now` therefore wins past `tolerance` — it comes from a machine
+  running NTP, which is the better of the two claims, and it is right to within
+  the handling delay rather than to within nine hours.
+
+  **The tolerance is for delay, not for drift.** A stamp can legitimately sit a
+  little behind `now` — MQTT relay and the collector's own queue both cost real
+  seconds — so the window has to be wide enough to leave a healthy radio alone.
+  It does not need to be wide enough to accommodate a wrong clock, and the two
+  are separated by orders of magnitude: normal skew here measured 15 seconds
+  against a fault of 32,870. Anything in between is a judgement call nobody has
+  had to make yet, and `RX_TIME_TOLERANCE` is where to make it.
+
+  Returns the stamp to store, and the signed error we rejected — positive when
+  the radio is behind us — or None when the radio was believed. The error is
+  returned rather than logged because this runs per packet: what to say about a
+  wrong clock, and how often, is the caller's problem (see `_checked_rx_time`).
+
+  `not stamp` rather than a `.get` default, for the reason the `or` it replaces
+  was there: rxTime is 0 *or absent* when the device has no time fix, and a
+  default only answers the absent half. The no-fix case has to be caught before
+  the tolerance check and not by it — a 0 reaching the comparison is a 56-year
+  error, reported as a wrong clock when what it means is no clock, and there is
+  nothing to warn about because the fallback was always going to be used.
+  """
+  stamp = packet.get("rxTime")
+
+  if not stamp:
+    return now, None
+
+  if tolerance and abs(now - stamp) > tolerance:
+    return now, now - stamp
+
+  return stamp, None
+
+
+
+
 def _identity_label(row: dict) -> str:
   """Render a node row's identity for the log — "Foo Bar (FOO)" when it has
   both names, whichever one it has when it has one, "unnamed" when it has
@@ -411,6 +464,19 @@ class MeshtasticCollector:
     # position packets is the other honest explanation for an empty message list.
     self._nontext_counts: dict[tuple[int, str], int] = {}
     self._rx_summary_at = time.time()
+
+    # The radio clock error this collector has already complained about, so a
+    # wrong clock is reported when it starts being wrong and not once per packet
+    # for as long as it stays that way. None means the radio is currently
+    # believed — which is also the starting state, so a healthy radio never
+    # writes a line here at all.
+    #
+    # Held as the error rather than as a bool because the interesting events are
+    # the transitions: a clock that goes wrong, a clock that changes *how* wrong
+    # it is (a reboot, or somebody setting it to something else wrong), and a
+    # clock that comes back. A bool can only see the first of those, and the
+    # third is the one an operator is waiting for after running --set-time.
+    self._rx_time_error: Optional[int] = None
 
     # When the link last proved it was alive, for the LIVENESS_TIMEOUT watchdog.
     # Written by the receive handlers on meshtastic's reader thread and read by
@@ -1879,11 +1945,14 @@ class MeshtasticCollector:
       "decoded": decoded,
       "snr": _first_value(packet, "rxSnr", "snr"),
       "rssi": _first_value(packet, "rxRssi", "rx_rssi"),
-      # The packet's own clock. rxTime is 0 or absent when the device has no
-      # time fix, but a live packet is still live — the wall clock is the
-      # honest fallback here, and only here; node dicts carry lastHeard or
-      # nothing.
-      "lastHeard": packet.get("rxTime") or int(time.time()),
+      # The packet's own clock where it can be trusted, ours where it cannot —
+      # see `_rx_time`. Checked here and only here: a packet is arriving now, so
+      # "now" is a real answer for it. The initial sync's node dicts carry a
+      # cached lastHeard that genuinely refers to the past, and substituting the
+      # wall clock there would claim this radio just heard a node it last heard
+      # yesterday. Those stay as the device reported them; nodes.last_seen heals
+      # itself on the next live packet, via the max() in _merge_node_data.
+      "lastHeard": self._checked_rx_time(packet),
       "hopsAway": _hops_taken(packet),
       # Deliberately coerced to a real bool rather than passed through. The
       # library drops proto fields sitting at their default, so a plain LoRa
@@ -1938,6 +2007,63 @@ class MeshtasticCollector:
     # note there is the whole argument and should be read before changing either
     # end of this.
     self._on_node_update(normalized, existing=existing)
+
+
+
+
+  def _checked_rx_time(self, packet: dict) -> int:
+    """`_rx_time` for this packet, saying so the first time the radio is wrong.
+
+    **A silent correction here would trade one invisible fault for another.** The
+    substituted stamp is the right value to store, but a radio whose clock is
+    nine hours out is a fact about the hardware, and repairing it on the way past
+    without a word would mean the archive looked healthy while the radio it
+    depends on stayed broken — the same shape of problem as the one this whole
+    check exists to catch, just moved.
+
+    So it is reported, and reported on transitions only. Every packet passes
+    through here, so a line per packet would bury the mesh traffic this log is
+    for; a line per *change* fires when the clock goes wrong, again if it changes
+    how wrong it is, and once more when it comes back. That last line is why the
+    recovery case is here at all: after fixing a clock the question is "did that
+    work", and the honest answer belongs in the log rather than in a query
+    somebody has to know how to write.
+
+    `tolerance` is read per packet rather than held on the instance. Config
+    caches after its first load, so this is a dict lookup and not a file read —
+    cheap enough that the setting is worth keeping in one place.
+    """
+    tolerance = int(Config.get("RX_TIME_TOLERANCE", 0))
+    stamp, error = _rx_time(packet, int(time.time()), tolerance)
+
+    if error is None:
+      if self._rx_time_error is not None:
+        logging.info(
+          "Radio clock agrees with ours again, within %s; believing rxTime once "
+          "more",
+          logfmt.format_duration(tolerance),
+        )
+        self._rx_time_error = None
+      return stamp
+
+    # Reported when the error appears and when it moves by more than the
+    # tolerance itself. A wrong clock still ticks, so the measured error wanders
+    # by a second or two between packets; re-announcing that would be the
+    # per-packet line this method exists to avoid.
+    if (
+      self._rx_time_error is None
+      or abs(error - self._rx_time_error) > max(tolerance, 1)
+    ):
+      logging.warning(
+        "Radio clock is %s %s ours; stamping arrivals with our own clock "
+        "instead. The radio cannot fix this itself — set it with "
+        "`meshtastic --set-time` (needs the port, so stop this collector first)",
+        logfmt.format_duration(abs(error)),
+        "behind" if error > 0 else "ahead of",
+      )
+      self._rx_time_error = error
+
+    return stamp
 
 
 
@@ -2509,14 +2635,17 @@ class MeshtasticCollector:
       )
       return
 
-    # `or`, not a `.get` default: rxTime is 0 *or absent* when the device has no
-    # time fix, and `.get("rxTime", ...)` only answers the absent half. A live
-    # packet is still live, so the wall clock is the honest fallback — the same
-    # reasoning, and the same expression, as the `lastHeard` line in
-    # _handle_receive. Written the other way here, a radio with no fix stamped
-    # every message it heard at the epoch and sorted them below the archive
-    # forever.
-    rx_time = packet.get("rxTime") or int(time.time())
+    # The same check, and the same reasoning, as the `lastHeard` line in
+    # _handle_receive — see `_rx_time`. A message row is the one place a wrong
+    # stamp is permanent: nodes.last_seen is overwritten by the next packet, but
+    # `rx_time` here is written once and is also the sort key and the paging
+    # cursor, so a bad clock does not just mislabel a message, it files it in the
+    # wrong place in the archive and both readers page around it.
+    #
+    # Called rather than passed down from the receive handler. One extra dict
+    # lookup and clock read per archived message, in exchange for the two paths
+    # not being able to disagree about what time it is.
+    rx_time = self._checked_rx_time(packet)
     snr = packet.get("rxSnr")
     rssi = packet.get("rxRssi")
     hop_count = _hops_taken(packet)

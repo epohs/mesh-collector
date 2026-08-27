@@ -34,6 +34,7 @@ COLLECTOR_CONFIG = {
   "BLE_RECONNECT_ATTEMPTS": 5,        # Reopen a dropped BLE link this many times before exiting; 0 disables
   "BLE_RECONNECT_BACKOFF": 5,         # Seconds before the first BLE retry, doubling to a 60s cap
   "LIVENESS_TIMEOUT": 0,              # Seconds of silence before probing the link; 0 disables
+  "RX_TIME_TOLERANCE": 900,           # Seconds the radio's clock may differ from ours before we stop believing it; 0 disables
   "STORE_DIRECT_MESSAGES": False,     # Should the collector archive direct messages
   "LOG_PRIMARY_CHANNEL": True,        # Should we track primary channel messages
   "PRIMARY_CHANNEL": 0,               # Primary channel index (usually 0)
