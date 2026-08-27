@@ -1668,12 +1668,7 @@ class MeshtasticCollector:
       request, message_id, is_direct, is_reaction
     )
 
-    logging.info(
-      "TX %s %s: %s",
-      request.destination if is_direct else f"CH{request.channel_index}",
-      "(archived)" if archived else "(not archived)",
-      request.text[:100],
-    )
+    self._log_outbound(request, is_direct, archived)
 
     pending.respond({
       "message_id": message_id,
@@ -1683,6 +1678,68 @@ class MeshtasticCollector:
       "want_ack": want_ack,
       "rx_time": rx_time,
     })
+
+
+
+
+  def _log_outbound(
+    self, request: SendTextRequest, is_direct: bool, archived: bool
+  ) -> None:
+    """The one INFO line for a message this collector just sent.
+
+    `Self > NCMesh: on my way`, and `Self > !4359022c (96cf): on my way` for a
+    direct message. **Both halves are words the pane already has a colour for**,
+    which is the whole reason for the shape: `Self` is what every other line
+    about the attached device calls it — `Self !eeb826a4 updated:`, grouped by
+    the tidy log's selflog.py — and mesh-console paints it the viewer frame's
+    own colour; the target is exactly the label a *received* line leads with,
+    the channel name in the sidebar's red or the node label in its yellow. So an
+    outbound message names the channel row or the node row it went to, the same
+    way an inbound one names the row it came from.
+
+    `TX CH1` was neither. `TX` named a direction in a word that appears nowhere
+    else in the interface, and `CH1` was the protobuf's index sitting where the
+    reader had gone to the trouble of naming the channel — the same fault
+    `_channel_label` was written to fix on the receive side. Jason's, 2026-08-27.
+
+    **`(archived)` is dropped rather than moved.** It was on every one of these
+    lines saying the thing that is true unless something is wrong, and each way
+    it can be false already writes a line that says more than the bracket did:
+    `_archive_outbound` logs the DEBUG for direct-message storage being off, and
+    the traceback for a write that threw. What is left for this line to carry is
+    that exception, and it carries it where a metrics suffix goes rather than in
+    front of the text, so the two runs the eye is scanning for stay in their
+    columns on every line.
+
+    Untidy logs keep the line exactly as it was, like every other formatting
+    decision in this module.
+    """
+    if not logfmt.tidy_logs():
+      logging.info(
+        "TX %s %s: %s",
+        request.destination if is_direct else f"CH{request.channel_index}",
+        "(archived)" if archived else "(not archived)",
+        request.text[:100],
+      )
+      return
+
+    # One indexed read on the rarest thing this collector does, for the same
+    # reason the receive path re-reads a row before logging a text message: a
+    # DM is worth naming after the node a person recognises, and the send path
+    # never had the row in hand to begin with. A destination with no row — a
+    # node this archive has never heard from — falls back to the bare id.
+    target = (
+      _node_label(request.destination, self.storage.get_node(request.destination))
+      if is_direct
+      else self._channel_label(request.channel_index)
+    )
+
+    logging.info(
+      "Self > %s: %s%s",
+      target,
+      request.text[:100],
+      "" if archived else "  (not archived)",
+    )
 
 
 
