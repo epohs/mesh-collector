@@ -138,7 +138,15 @@ Every timestamp in the archive is a Unix epoch integer, and the ones on arriving
 
 A rejected stamp is reported, at WARNING, on transitions only: when the clock goes wrong, again if it changes how wrong it is, and once at INFO when it comes back. Every packet passes through the check, so a line per packet would bury the mesh traffic the log is for — and the recovery line is there because after fixing a clock the question is "did that work", which the log should answer without a query.
 
-**The collector cannot fix the radio, and does not pretend to.** Substituting a good stamp keeps the archive honest, but the radio stays wrong until something sets it: `meshtastic --set-time`, or a phone app connecting. That needs the port, so the collector has to stop first. Nothing in `meshtastic-python` sets a node's clock on connect, so a radio that comes up without the time will stay without it indefinitely.
+#### Setting the radio's clock
+
+The check above keeps the archive honest, but it treats the symptom — the radio stays wrong until something sets it, and nothing in `meshtastic-python` does that on connect. So `SET_NODE_TIME` (default on) hands the radio this host's clock as the link opens, at startup and again on every BLE reopen. A firmware reboot is one of the things that drops a BLE link, and a radio that has just rebooted is exactly the one whose clock needs setting.
+
+This is an admin message to the *local* node, so it is not a transmit and is not gated on `ENABLE_TX`: it travels the link the collector already owns, puts nothing on the air, and no other node can see it. `SET_NODE_TIME` exists anyway, because writing to the device at all is a change of posture for an archive-only collector and that should be a decision rather than a surprise.
+
+**It will not set the clock from a clock it cannot vouch for.** This Pi has no hardware RTC — `timedatectl` reports `RTC time: n/a` — so between boot and the first NTP reply it does not know the time either, and pushing unconditionally would write a fabricated boot-time date into the one device with no way to argue, on exactly the reboot that most needs fixing. The collector asks the kernel via `ntp_adjtime` (a read-only query, no privileges, and it answers whichever NTP daemon is running, which the systemd-timesyncd marker file does not) and declines with a WARNING while the answer is no. If the question itself cannot be asked — a platform without the call — it proceeds and says so, since declining there would mean the feature silently never fires on hosts whose clock was fine all along.
+
+A failure to set the clock is a log line, never an exit. Archiving with a wrong clock is worse than archiving with a right one and far better than not archiving, so the radio keeps whatever clock it had and the `rxTime` check above goes on covering it.
 
 The check is on the packet path only. The initial sync replays the device's node cache, whose `lastHeard` values genuinely refer to the past; substituting the wall clock there would claim the radio just heard a node it last heard yesterday. Those are stored as the device reported them, and `nodes.last_seen` corrects itself on the next live packet.
 

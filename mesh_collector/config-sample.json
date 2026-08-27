@@ -17,6 +17,7 @@
     "BLE_ADDRESS": "",
     "LIVENESS_TIMEOUT": 0,
     "RX_TIME_TOLERANCE": 900,
+    "SET_NODE_TIME": true,
 
     "STORE_DIRECT_MESSAGES": false,
     "LOG_PRIMARY_CHANNEL": true,

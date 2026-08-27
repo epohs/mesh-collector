@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import atexit
+import ctypes
+import ctypes.util
 import json
 import logging
 import os
@@ -284,6 +286,57 @@ def _rx_time(packet: dict, now: int, tolerance: int) -> tuple[int, Optional[int]
 
 
 
+def _host_clock_is_synchronised() -> Optional[bool]:
+  """Whether this machine's clock is disciplined by NTP. None if unanswerable.
+
+  **The other half of `_rx_time`, and the reason it is asked at all.** Handing
+  the radio our clock is only an improvement if our clock is right, and on this
+  Pi that is not a given: it has no hardware RTC (`timedatectl` reports `RTC
+  time: n/a`), so between boot and the first NTP reply it does not know the time
+  either. A collector that pushed the clock unconditionally at startup would,
+  on exactly the reboot that most needs fixing, write a fabricated boot-time
+  date into the one device that had no way to argue.
+
+  `ntp_adjtime` with a zeroed `timex` is a read-only query — modes 0 asks for
+  the clock's state and sets nothing — and it needs no privileges. It answers
+  regardless of which daemon is doing the disciplining, which the alternative
+  did not: `/run/systemd/timesync/synchronized` exists only under
+  systemd-timesyncd, so on a chrony or ntpd host it is absent for a clock that
+  is perfectly well synchronised, and reading it would have meant declining to
+  set the time on hosts where doing so was safe.
+
+  TIME_ERROR (5) is the kernel's "clock not synchronized" — the state a host
+  with no NTP at all reports, since STA_UNSYNC is then set. Verified against
+  linux/timex.h on the deployment host, and the call returns TIME_OK on both
+  Linux and macOS, which is where this gets developed.
+
+  Returns None rather than False when the call cannot be made — no libc symbol,
+  a platform that does not implement it. That distinction is the caller's to
+  act on, and it is not the same as an answer: False means "asked, and the
+  clock is not to be trusted", None means "nobody here can say".
+  """
+  TIME_ERROR = 5
+
+  try:
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    ntp_adjtime = getattr(libc, "ntp_adjtime", None) or getattr(
+      libc, "adjtimex", None
+    )
+    if ntp_adjtime is None:
+      return None
+
+    # Deliberately oversized and zero-filled rather than a declared Structure.
+    # `struct timex` differs in size and layout across platforms and has grown
+    # fields over time; the return code is the whole of what this needs, so the
+    # safe move is to give the kernel more room than any layout requires and
+    # read none of it back. A short buffer here would be a stack overwrite.
+    return ntp_adjtime(ctypes.create_string_buffer(512)) != TIME_ERROR
+  except (OSError, AttributeError, TypeError, ValueError):
+    return None
+
+
+
+
 def _identity_label(row: dict) -> str:
   """Render a node row's identity for the log — "Foo Bar (FOO)" when it has
   both names, whichever one it has when it has one, "unnamed" when it has
@@ -524,6 +577,14 @@ class MeshtasticCollector:
       sys.exit(1)
 
     self._watch_for_ble_disconnect()
+
+    # As early as the link allows, and before _initial_node_sync below, so that
+    # any packet arriving during startup is stamped by a radio whose clock has
+    # already been corrected. It cannot fix the sync's own cached lastHeard
+    # values — those were written by the old clock and _rx_time deliberately
+    # leaves them alone — but it means the live traffic behind them is right from
+    # the first packet rather than from the first one after a warning.
+    self._set_node_time()
 
     # **A collector that cannot describe its channels must not archive into
     # them.** Nothing is in flight yet — the control socket is not listening and
@@ -1299,6 +1360,14 @@ class MeshtasticCollector:
           continue
 
         self._watch_for_ble_disconnect()
+
+        # Again on every reopen, not only at startup. A firmware reboot is one of
+        # the things that drops a BLE link in the first place, and a radio that
+        # has just rebooted is precisely the one whose clock needs setting — so
+        # the reconnect path is the second place this matters, not an incidental
+        # one.
+        self._set_node_time()
+
         self._last_activity = time.time()
         self._reconnect_count += 1
 
@@ -2007,6 +2076,82 @@ class MeshtasticCollector:
     # note there is the whole argument and should be read before changing either
     # end of this.
     self._on_node_update(normalized, existing=existing)
+
+
+
+
+  def _set_node_time(self) -> None:
+    """Give the radio this machine's clock, if this machine's clock is worth having.
+
+    **This is the fix for the cause; `_rx_time` only ever covered the symptom.**
+    A Meshtastic node with no GPS has no time source of its own, and nothing in
+    meshtastic-python sets a node's clock on connect — `setTime` exists but is
+    reached only from the CLI's `--set-time`. So a radio that comes up without
+    the time stays without it until a human notices, which in the 2026-08-25 case
+    took two days. Doing it here means every restart the service manager performs
+    — after a reboot, a reflash, a BLE session, a crash — hands the radio a
+    correct clock as a side effect of reconnecting.
+
+    An admin message to the *local* node, which is why this is not a transmit and
+    is not gated on ENABLE_TX. It travels the serial, TCP or BLE link this
+    collector already owns and puts nothing on the air; no other node can see it
+    and the mesh cannot tell it happened. SET_NODE_TIME exists anyway, because
+    writing to the device at all is a change of posture for an archive-only
+    collector and that should be somebody's decision rather than a default
+    nobody was told about.
+
+    **A failure here must never stop the collector.** Archiving with a wrong
+    clock is worse than archiving with a right one and much better than not
+    archiving, so every outcome below is a log line and a return. That includes
+    the bare `Exception`: this reaches into the library to send an admin packet
+    and wait on a session key, across three transports, and the failure modes are
+    neither enumerable from here nor worth exiting over. The radio keeps whatever
+    clock it had, `_rx_time` goes on covering it, and the WARNING says which.
+    """
+    if not Config.get("SET_NODE_TIME", True):
+      return
+
+    synchronised = _host_clock_is_synchronised()
+
+    if synchronised is False:
+      # The reboot case, and the whole reason for the guard. Said at WARNING
+      # because it means the radio is going to keep a clock nobody has corrected
+      # while this host cannot supply one either — both clocks are now suspect,
+      # and the archive is relying on `_rx_time` alone until NTP answers.
+      logging.warning(
+        "Not setting the radio's clock: this host's own clock is not "
+        "NTP-synchronised yet. This machine has no hardware RTC, so its time "
+        "after a reboot is a guess until NTP answers, and a guess is not worth "
+        "writing into the radio. Arrivals are stamped by whichever clock "
+        "RX_TIME_TOLERANCE prefers until then."
+      )
+      return
+
+    if synchronised is None:
+      # Nobody could answer, which is not the same as a bad answer. Proceeding
+      # is the better bet: the platforms where the query fails are not the Pi
+      # this guard was written for, and declining here would mean the feature
+      # silently never fires on a host whose clock was fine all along.
+      logging.info(
+        "Cannot read this host's NTP state; setting the radio's clock anyway"
+      )
+
+    try:
+      self.interface.getNode("^local").setTime()
+    except Exception as error:
+      logging.warning(
+        "Could not set the radio's clock (%s). The radio keeps the clock it "
+        "had; set it by hand with `meshtastic --set-time` if arrivals start "
+        "being stamped by this host instead of the radio.",
+        error,
+      )
+      return
+
+    # Said plainly and once per connect. The radio's clock is invisible from
+    # every other surface — it is not a field in the archive and not a line the
+    # readers can show — so "we set it, and to what" is the only record that the
+    # thing which broke on 2026-08-25 is being actively held right.
+    logging.info("Set the radio's clock from this host (%d)", int(time.time()))
 
 
 
