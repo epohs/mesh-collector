@@ -104,25 +104,19 @@ If both run on the same host under systemd, give the collector unit `After=mesht
 
 #### BLE — a node over Bluetooth
 
-Set `CONNECTION_MODE` to `ble` and `BLE_ADDRESS` to the node's address or its advertised name. `meshtastic --ble-scan` lists what is in range. There is no default worth shipping, so this one has to be filled in — a blank `BLE_ADDRESS` stops the collector at startup rather than letting it attach to whichever node happened to answer first.
+Set `CONNECTION_MODE` to `ble` and `BLE_ADDRESS` to the node's address or its advertised name. `meshtastic --ble-scan` lists what is in range. .
 
 Pair the host with the node before the first run. The collector cannot answer a PIN prompt, and an unpaired node fails with the library's own message about the `bluetooth` group and the PIN — which on Linux is also the hint worth taking literally: the user running the collector needs to be in `bluetooth` and able to reach BlueZ over DBus.
 
-**A node serves serial or BLE, not both.** While something holds the USB serial port, the node stops advertising over Bluetooth entirely — a scan finds nothing, and it reappears within seconds of the serial client letting go. No power cycle is needed. So BLE mode is for a node no cable is attached to, which is what it was always for; pointing a BLE collector at a node that a serial collector is already archiving from does not give you two readers, it gives you one reader and one scan that finds nothing.
+**A node serves either serial or BLE, not both.**
 
 #### When a BLE link drops
 
 BLE drops and comes back — someone carries the node out of range, the firmware reboots, the host's Bluetooth cycles — and unlike the other two transports the library neither reports it nor recovers from it. `BLEInterface` has no reconnect at all, and a dropped link publishes no event, so a collector left to itself sits there alive and archiving nothing.
 
-So on BLE the collector supervises the link itself, and it watches three ways at once. First and strongest is a disconnect callback of our own, put in place of the library's: the host's Bluetooth stack says the peripheral is gone and we hear it directly. That one is worth understanding, because it is not only the detector — the callback it displaces is what wedges the library on a dropped link, so installing ours is half the cure as well. On hardware it has caught every drop so far, within a millisecond of the radio going.
+So the collector supervises the link itself, and attempts to reconnect when it can.
 
-Behind it, once a second, is a plain read of whether the host still considers the peripheral connected. It asks nothing of the library and waits on nothing, so it answers even when the rest of the interface will not, and it is what still notices a drop if the callback ever fails to install against some future version of bleak. Third is the library's own read thread: if it has died, the link died under it. Whichever signal speaks first, the collector says so in the journal, throws the dead interface away and opens a new one. `BLE_RECONNECT_ATTEMPTS` (default 5) caps how many times, and `BLE_RECONNECT_BACKOFF` (default 5 seconds) is the first gap, doubling up to a minute. The first attempt is immediate.
-
-Anything the collector cannot read, it treats as healthy. A library that has changed shape underneath us reads as a missing attribute, and a supervisor that tears down a working link because it could not find a field is worse than one that misses a drop the other two signals catch a moment later.
-
-Running out of attempts exits nonzero, which is what serial and TCP do on the first drop — the retry loop is in front of that behaviour, not instead of it. A radio that is genuinely gone still becomes the service manager's problem rather than a process that looks healthy forever. Setting `BLE_RECONNECT_ATTEMPTS` to `0` gives BLE the same one-drop-one-exit policy the other transports have.
-
-**Recovery is not continuity.** Packets that arrived while the link was down are gone; nothing replays LoRa. What recovery buys is that archiving resumes in seconds without a restart, and that the gap is one line in the journal instead of a silence you find days later.
+**Packets that arrived while the link was down are gone**. The missing time period while BLE was down is noted with a single line in the journal.
 
 #### Watching for a link that goes quiet
 
@@ -130,27 +124,10 @@ Running out of attempts exits nonzero, which is what serial and TCP do on the fi
 
 It is not BLE's drop detector and does not need to be switched on for BLE — the supervision above is always on, costs nothing, and cannot mistake a quiet mesh for a dead link the way a silence timer can. On BLE a failed probe feeds the reconnect above rather than exiting.
 
-#### When the radio's clock is wrong
 
-Every timestamp in the archive is a Unix epoch integer, and the ones on arriving traffic come from `rxTime` — written by the receiving radio, off the radio's own clock. A Meshtastic node with no GPS and no client to set its clock has no way to know the time and no way to find out it is wrong, so that stamp is a claim rather than a fact, and it is worth checking against the one thing that can check it: a packet being handled right now.
-
-`RX_TIME_TOLERANCE` (default `900`, in seconds) is how far the radio's stamp may sit from this machine's clock before the collector stops believing it and stamps the arrival with its own clock instead. The window is sized for delay, not for drift — MQTT relay and the collector's own queue cost real seconds, and a healthy radio here measured 15 of them, against a fault that measured 32,870. Setting it to `0` disables the check and trusts the radio unconditionally, which is what this collector did before the check existed.
-
-A rejected stamp is reported, at WARNING, on transitions only: when the clock goes wrong, again if it changes how wrong it is, and once at INFO when it comes back. Every packet passes through the check, so a line per packet would bury the mesh traffic the log is for — and the recovery line is there because after fixing a clock the question is "did that work", which the log should answer without a query.
-
-#### Setting the radio's clock
-
-The check above keeps the archive honest, but it treats the symptom — the radio stays wrong until something sets it, and nothing in `meshtastic-python` does that on connect. So `SET_NODE_TIME` (default on) hands the radio this host's clock as the link opens, at startup and again on every BLE reopen. A firmware reboot is one of the things that drops a BLE link, and a radio that has just rebooted is exactly the one whose clock needs setting.
-
-This is an admin message to the *local* node, so it is not a transmit and is not gated on `ENABLE_TX`: it travels the link the collector already owns, puts nothing on the air, and no other node can see it. `SET_NODE_TIME` exists anyway, because writing to the device at all is a change of posture for an archive-only collector and that should be a decision rather than a surprise.
-
-**It will not set the clock from a clock it cannot vouch for.** This Pi has no hardware RTC — `timedatectl` reports `RTC time: n/a` — so between boot and the first NTP reply it does not know the time either, and pushing unconditionally would write a fabricated boot-time date into the one device with no way to argue, on exactly the reboot that most needs fixing. The collector asks the kernel via `ntp_adjtime` (a read-only query, no privileges, and it answers whichever NTP daemon is running, which the systemd-timesyncd marker file does not) and declines with a WARNING while the answer is no. If the question itself cannot be asked — a platform without the call — it proceeds and says so, since declining there would mean the feature silently never fires on hosts whose clock was fine all along.
-
-A failure to set the clock is a log line, never an exit. Archiving with a wrong clock is worse than archiving with a right one and far better than not archiving, so the radio keeps whatever clock it had and the `rxTime` check above goes on covering it.
-
-The check is on the packet path only. The initial sync replays the device's node cache, whose `lastHeard` values genuinely refer to the past; substituting the wall clock there would claim the radio just heard a node it last heard yesterday. Those are stored as the device reported them, and `nodes.last_seen` corrects itself on the next live packet.
 
 All config options are documented in [`config.py`](/mesh_collector/config.py).
+
 
 
 ### Running the Collector script
@@ -165,9 +142,7 @@ python scripts/run_collector.py
 The database will be created and migrated automatically if needed. Nodes and messages will be written to the database as long as this script is running.
 
 > [!WARNING]
-> If you pull the repo and the database schema ([`schema.sql`](/mesh_collector/db/schema.sql)) version changes your database will be dropped and recreated, wiping all existing data.
->
-> As of schema version 0.6.0 the collector refuses to start rather than do this. To allow the rebuild, set `ALLOW_DESTRUCTIVE_REBUILD` to true in your `config.json`. A timestamped backup of the database is written beside it before any table is dropped.
+> If you enable `ALLOW_DESTRUCTIVE_REBUILD` and pull the repo and the database schema ([`schema.sql`](/mesh_collector/db/schema.sql)) version changes your database will be dropped and recreated, wiping all existing data. A timestamped backup of the database is written beside it before any table is dropped.
 
 
 ### Transmitting (optional, off by default)
