@@ -74,6 +74,16 @@ uv sync
 
 Copy the [`mesh_collector/config-sample.json`](/mesh_collector/config-sample.json) file and create a new `config.json` file. I think the values are fairly self-explanatory with one exception.
 
+All config options are documented in [`config.py`](/mesh_collector/config.py).
+
+##### Local development on macOS
+
+Everything above assumes the Raspberry Pi, which is where this actually runs. If you are developing on a Mac, `/dev/serial/by-id/` will not be there — it is a Linux `udev` feature, and macOS has no equivalent. Your device shows up directly in `/dev` instead, so run `ls /dev/cu.usbmodem*` and use what you find, something like `“SERIAL_PORT”: “/dev/cu.usbmodem101”,`.
+
+Use the `cu.` name and not the `tty.` one beside it. They are the same device, but opening the `tty.` form blocks waiting for carrier detect, and the collector will simply hang at startup with no error to explain itself.
+
+The port number is assigned when the device is plugged in and is not stable across reboots or a different USB port, so expect to update it occasionally. That is a good reason to keep macOS a development-only arrangement and leave deployment on the Pi, where `by-id` gives you a name that does not move.
+
 #### How the collector reaches your node
 
 `CONNECTION_MODE` chooses one of three, and it is `serial` unless you say otherwise. Only the settings for the mode you pick are read, so the other two can stay at whatever the sample has in them.
@@ -85,14 +95,6 @@ The setting `SERIAL_PORT` in the example uses the device name for maximum compat
 You should see something like: `usb-RAKwireless_WisCore_RAK4631_Board_1X2X3X4X5X6X-if00 -> ../../ttyACM0`
 
 Use that value in your own `config.json` using `“SERIAL_PORT”: “/dev/serial/by-id/YOUR_DEVICE_ID”,` instead of the `/dev/DEVICE_NAME` that I have in my example.
-
-##### Local development on macOS
-
-Everything above assumes the Raspberry Pi, which is where this actually runs. If you are developing on a Mac, `/dev/serial/by-id/` will not be there — it is a Linux `udev` feature, and macOS has no equivalent. Your device shows up directly in `/dev` instead, so run `ls /dev/cu.usbmodem*` and use what you find, something like `“SERIAL_PORT”: “/dev/cu.usbmodem101”,`.
-
-Use the `cu.` name and not the `tty.` one beside it. They are the same device, but opening the `tty.` form blocks waiting for carrier detect, and the collector will simply hang at startup with no error to explain itself.
-
-The port number is assigned when the device is plugged in and is not stable across reboots or a different USB port, so expect to update it occasionally. That is a good reason to keep macOS a development-only arrangement and leave deployment on the Pi, where `by-id` gives you a name that does not move.
 
 #### TCP — a node running `meshtasticd`
 
@@ -124,9 +126,6 @@ So the collector supervises the link itself, and attempts to reconnect when it c
 
 It is not BLE's drop detector and does not need to be switched on for BLE — the supervision above is always on, costs nothing, and cannot mistake a quiet mesh for a dead link the way a silence timer can. On BLE a failed probe feeds the reconnect above rather than exiting.
 
-
-
-All config options are documented in [`config.py`](/mesh_collector/config.py).
 
 
 
